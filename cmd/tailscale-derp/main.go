@@ -24,8 +24,7 @@ import (
 	"github.com/LazuliKao/tailscale-derp/internal/traffic"
 	"github.com/LazuliKao/tailscale-derp/internal/tracker"
 
-	"tailscale.com/derp"
-	"tailscale.com/derp/derphttp"
+	"tailscale.com/derp/derpserver"
 	"tailscale.com/net/stunserver"
 	"tailscale.com/types/key"
 )
@@ -531,9 +530,14 @@ func startDERP(cfg *Config, state *runtimeState, persister *traffic.Persister) e
 		return fmt.Errorf("load node key: %w", err)
 	}
 
-	server := derp.NewServer(privateKey, log.Printf)
+	server := derpserver.New(privateKey, log.Printf)
 	if cfg.Mesh {
-		server.SetMeshKey(cfg.MeshKey)
+		if err := server.SetMeshKey(cfg.MeshKey); err != nil {
+			if state != nil {
+				state.setError(err)
+			}
+			return fmt.Errorf("parse mesh key: %w", err)
+		}
 	}
 	server.SetVerifyClient(true)
 	opsAddr := cfg.OpsAddr
@@ -579,10 +583,10 @@ func startDERP(cfg *Config, state *runtimeState, persister *traffic.Persister) e
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/derp", derphttp.Handler(server))
-	mux.HandleFunc("/derp/probe", derphttp.ProbeHandler)
-	mux.HandleFunc("/derp/latency-check", derphttp.ProbeHandler)
-	mux.HandleFunc("/generate_204", derphttp.ServeNoContent)
+	mux.Handle("/derp", derpserver.Handler(server))
+	mux.HandleFunc("/derp/probe", derpserver.ProbeHandler)
+	mux.HandleFunc("/derp/latency-check", derpserver.ProbeHandler)
+	mux.HandleFunc("/generate_204", derpserver.ServeNoContent)
 
 	httpServer := &http.Server{
 		Addr:    cfg.Listen,
@@ -620,8 +624,8 @@ func startDERP(cfg *Config, state *runtimeState, persister *traffic.Persister) e
 	return err
 }
 
-func publishDERPMetrics(server *derp.Server) expvar.Var {
-	ev := server.ExpVar()
+func publishDERPMetrics(server *derpserver.Server) expvar.Var {
+	ev := server.ExpVar(false)
 	if expvar.Get("derp") == nil {
 		expvar.Publish("derp", ev)
 	}
