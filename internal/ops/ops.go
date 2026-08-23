@@ -290,6 +290,11 @@ func NewMux(cfg Config, snapshot Snapshot, executor Executor, mf MetricsFunc, t 
 	mux.HandleFunc("/verify", handleVerify(verifier))
 	mux.HandleFunc("/devices", handleDevices(verifier))
 	mux.HandleFunc("/devices/refresh", handleDevicesRefresh(verifier))
+	mux.HandleFunc("GET /tailnets", handleAPIInstances(verifier.store))
+	mux.HandleFunc("PUT /tailnets/{instance}/devices/{deviceID}/ip", handleSetDeviceIPv4(verifier.store))
+	mux.HandleFunc("GET /tailnets/{instance}/acl", handlePolicyGet(verifier.store))
+	mux.HandleFunc("POST /tailnets/{instance}/acl/validate", handlePolicyValidate(verifier.store))
+	mux.HandleFunc("PUT /tailnets/{instance}/acl", handlePolicySet(verifier.store))
 
 	if t != nil {
 		mux.HandleFunc("/peers", HandlePeers(t))

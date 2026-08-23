@@ -74,15 +74,16 @@ func TestDeviceStoreRefreshFiltersAndAuthorizesDevices(t *testing.T) {
 	secret := "tskey-api-secret"
 	nodeKey := key.NewNode().Public()
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer "+secret {
-			t.Fatalf("unexpected authorization header: %q", r.Header.Get("Authorization"))
+		username, password, ok := r.BasicAuth()
+		if !ok || username != secret || password != "" {
+			t.Fatalf("unexpected basic authentication: username=%q password=%q present=%v", username, password, ok)
 		}
 		if r.URL.Query().Get("fields") != "default" {
 			t.Fatalf("expected fields=default, got %q", r.URL.Query().Get("fields"))
 		}
-		_ = json.NewEncoder(w).Encode(apiDevicesResponse{Devices: []apiDevice{
-			{NodeID: "node-1", NodeKey: nodeKey.String(), Name: "allowed", Authorized: true},
-			{NodeID: "node-2", NodeKey: key.NewNode().Public().String(), Name: "unauthorized", Authorized: false},
+		_ = json.NewEncoder(w).Encode(map[string]any{"devices": []map[string]any{
+			{"nodeId": "node-1", "nodeKey": nodeKey.String(), "name": "allowed", "authorized": true},
+			{"nodeId": "node-2", "nodeKey": key.NewNode().Public().String(), "name": "unauthorized", "authorized": false},
 		}})
 	}))
 	defer api.Close()

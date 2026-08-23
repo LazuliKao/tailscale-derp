@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -15,6 +14,7 @@ import (
 	"github.com/LazuliKao/tailscale-derp/internal/httpjson"
 	"github.com/LazuliKao/tailscale-derp/internal/tracker"
 	"tailscale.com/client/local"
+	tailscaleapi "tailscale.com/client/tailscale/v2"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
@@ -83,30 +83,6 @@ type DevicesResponse struct {
 	Instances []DeviceSyncStatus `json:"instances"`
 }
 
-type apiDevice struct {
-	NodeID              string   `json:"nodeId"`
-	NodeKey             string   `json:"nodeKey"`
-	Name                string   `json:"name"`
-	Hostname            string   `json:"hostname"`
-	User                string   `json:"user"`
-	Addresses           []string `json:"addresses"`
-	OS                  string   `json:"os"`
-	ClientVersion       string   `json:"clientVersion"`
-	Authorized          bool     `json:"authorized"`
-	ConnectedToControl  bool     `json:"connectedToControl"`
-	LastSeen            string   `json:"lastSeen"`
-	Expires             string   `json:"expires"`
-	Tags                []string `json:"tags"`
-	IsExternal          bool     `json:"isExternal"`
-	IsEphemeral         bool     `json:"isEphemeral"`
-	MultipleConnections bool     `json:"multipleConnections"`
-}
-
-type apiDevicesResponse struct {
-	Devices       []apiDevice `json:"devices"`
-	NextPageToken string      `json:"nextPageToken"`
-}
-
 type deviceCache struct {
 	devices     map[string]Device
 	lastAttempt time.Time
@@ -120,7 +96,7 @@ type deviceStore struct {
 	configs   []APIConfig
 	cache     map[string]deviceCache
 	client    *http.Client
-	baseURL   string
+	baseURL   *url.URL
 	interval  time.Duration
 	ttl       time.Duration
 }
@@ -151,7 +127,7 @@ func newDeviceStore(cfg VerifyConfig) *deviceStore {
 		configs:  configs,
 		cache:    cache,
 		client:   &http.Client{Timeout: deviceRequestTimeout},
-		baseURL:  deviceAPIBaseURL,
+		baseURL:  mustParseURL(deviceAPIBaseURL),
 		interval: cfg.SyncInterval,
 		ttl:      cfg.CacheTTL,
 	}
@@ -200,50 +176,14 @@ func (s *deviceStore) refreshInstance(ctx context.Context, instance APIConfig) e
 	ctx, cancel := context.WithTimeout(ctx, deviceRequestTimeout)
 	defer cancel()
 
-	nextPageToken := ""
-	allDevices := make([]apiDevice, 0)
-	for {
-		endpoint := strings.TrimRight(s.baseURL, "/") + "/api/v2/tailnet/" + url.PathEscape(instance.Tailnet) + "/devices"
-		query := url.Values{"fields": []string{"default"}}
-		if nextPageToken != "" {
-			query.Set("pageToken", nextPageToken)
-		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"?"+query.Encode(), nil)
-		if err != nil {
-			s.recordFailure(instance.Name, err)
-			return err
-		}
-		req.Header.Set("Authorization", "Bearer "+instance.APIKey)
-		resp, err := s.client.Do(req)
-		if err != nil {
-			s.recordFailure(instance.Name, err)
-			return err
-		}
-		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-		resp.Body.Close()
-		if readErr != nil {
-			s.recordFailure(instance.Name, readErr)
-			return readErr
-		}
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			err = fmt.Errorf("Tailscale API returned HTTP %d", resp.StatusCode)
-			s.recordFailure(instance.Name, err)
-			return err
-		}
-		var payload apiDevicesResponse
-		if err := json.Unmarshal(body, &payload); err != nil {
-			s.recordFailure(instance.Name, err)
-			return err
-		}
-		allDevices = append(allDevices, payload.Devices...)
-		if payload.NextPageToken == "" {
-			break
-		}
-		nextPageToken = payload.NextPageToken
+	rawDevices, err := s.apiClient(instance).Devices().List(ctx, tailscaleapi.WithFields(tailscaleapi.IncludeFieldsDefault))
+	if err != nil {
+		s.recordFailure(instance.Name, err)
+		return err
 	}
 
-	devices := make(map[string]Device, len(allDevices))
-	for _, raw := range allDevices {
+	devices := make(map[string]Device, len(rawDevices))
+	for _, raw := range rawDevices {
 		device := sanitizeDevice(raw, instance)
 		if device.NodeKey != "" {
 			devices[device.NodeKey] = device
@@ -260,30 +200,64 @@ func (s *deviceStore) refreshInstance(ctx context.Context, instance APIConfig) e
 	return nil
 }
 
-func sanitizeDevice(raw apiDevice, instance APIConfig) Device {
+func (s *deviceStore) apiClient(instance APIConfig) *tailscaleapi.Client {
+	s.mu.RLock()
+	client := s.client
+	baseURL := s.baseURL
+	s.mu.RUnlock()
+	return &tailscaleapi.Client{
+		APIKey:  instance.APIKey,
+		BaseURL: baseURL,
+		HTTP:    client,
+		Tailnet: instance.Tailnet,
+	}
+}
+
+func sanitizeDevice(raw tailscaleapi.Device, instance APIConfig) Device {
 	label := instance.Label
 	if label == "" {
 		label = instance.Name
 	}
 	return Device{
-		NodeID:              raw.NodeID,
-		NodeKey:             raw.NodeKey,
-		Name:                raw.Name,
-		Hostname:            raw.Hostname,
-		User:                raw.User,
-		Addresses:           append([]string(nil), raw.Addresses...),
-		OS:                  raw.OS,
-		ClientVersion:       raw.ClientVersion,
-		Authorized:          raw.Authorized,
-		ConnectedToControl:  raw.ConnectedToControl,
-		LastSeen:            raw.LastSeen,
-		Expires:             raw.Expires,
-		Tags:                append([]string(nil), raw.Tags...),
-		IsExternal:          raw.IsExternal,
-		IsEphemeral:         raw.IsEphemeral,
-		MultipleConnections: raw.MultipleConnections,
-		Sources:             []string{label},
+		NodeID:             raw.NodeID,
+		NodeKey:            raw.NodeKey,
+		Name:               raw.Name,
+		Hostname:           raw.Hostname,
+		User:               raw.User,
+		Addresses:          append([]string(nil), raw.Addresses...),
+		OS:                 raw.OS,
+		ClientVersion:      raw.ClientVersion,
+		Authorized:         raw.Authorized,
+		ConnectedToControl: raw.ConnectedToControl,
+		LastSeen:           formatAPITime(raw.LastSeen),
+		Expires:            formatAPITimeValue(raw.Expires),
+		Tags:               append([]string(nil), raw.Tags...),
+		IsExternal:         raw.IsExternal,
+		IsEphemeral:        raw.IsEphemeral,
+		Sources:            []string{label},
 	}
+}
+
+func formatAPITime(value *tailscaleapi.Time) string {
+	if value == nil {
+		return ""
+	}
+	return formatAPITimeValue(*value)
+}
+
+func formatAPITimeValue(value tailscaleapi.Time) string {
+	if value.IsZero() {
+		return ""
+	}
+	return value.UTC().Format(time.RFC3339Nano)
+}
+
+func mustParseURL(value string) *url.URL {
+	parsed, err := url.Parse(value)
+	if err != nil {
+		panic(err)
+	}
+	return parsed
 }
 
 func (s *deviceStore) recordFailure(name string, err error) {
@@ -494,6 +468,6 @@ func (s *deviceStore) setHTTPClientForTest(client *http.Client, baseURL string) 
 		s.client = client
 	}
 	if baseURL != "" {
-		s.baseURL = strings.TrimRight(baseURL, "/")
+		s.baseURL = mustParseURL(strings.TrimRight(baseURL, "/"))
 	}
 }
