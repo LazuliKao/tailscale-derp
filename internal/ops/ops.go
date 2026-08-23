@@ -12,46 +12,50 @@ import (
 
 	"github.com/LazuliKao/tailscale-derp/internal/httpjson"
 	"github.com/LazuliKao/tailscale-derp/internal/service"
-	"github.com/LazuliKao/tailscale-derp/internal/traffic"
 	"github.com/LazuliKao/tailscale-derp/internal/tracker"
+	"github.com/LazuliKao/tailscale-derp/internal/traffic"
 )
 
 const verifyTimeout = 5 * time.Second
 
 type Config struct {
-	VerifyClientURLs     []string
-	VerifyClientFailOpen bool
-	Version              string
-	Listen               string
-	STUN                 bool
-	Mesh                 bool
-	OpsAddr              string
-	Health               string
-	TrafficPersist       bool
-	TrafficPath          string
-	TrafficInterval      int
+	Verify          VerifyConfig
+	Version         string
+	Listen          string
+	STUN            bool
+	Mesh            bool
+	OpsAddr         string
+	Health          string
+	TrafficPersist  bool
+	TrafficPath     string
+	TrafficInterval int
 }
 
 type Status struct {
-	VerifyClients []string `json:"verifyClients,omitempty"`
-	Running       bool     `json:"running"`
-	Version       string   `json:"version"`
-	Listen        string   `json:"listen"`
-	STUN          bool     `json:"stun"`
-	Mesh          bool     `json:"mesh"`
-	Metrics       string   `json:"metrics"`
-	Health        string   `json:"health"`
-	TrafficPersist bool    `json:"trafficPersist"`
-	TrafficPath    string  `json:"trafficPath,omitempty"`
-	TrafficInterval int    `json:"trafficInterval,omitempty"`
-	Error         string   `json:"error,omitempty"`
-	Clients       int      `json:"clients"`
-	Accepts       int64    `json:"accepts"`
-	BytesRecv     int64    `json:"bytesRecv"`
-	BytesSent     int64    `json:"bytesSent"`
-	AcceptsTotal  int64    `json:"acceptsTotal,omitempty"`
-	BytesRecvTotal int64   `json:"bytesRecvTotal,omitempty"`
-	BytesSentTotal int64   `json:"bytesSentTotal,omitempty"`
+	VerifyClients      []string `json:"verifyClients,omitempty"`
+	VerifyEnabled      bool     `json:"verifyEnabled"`
+	VerifyURLsEnabled  bool     `json:"verifyURLsEnabled"`
+	VerifyTailscaled   bool     `json:"verifyTailscaled"`
+	VerifyAPIEnabled   bool     `json:"verifyAPIEnabled"`
+	VerifyAPIInstances int      `json:"verifyAPIInstances"`
+	Running            bool     `json:"running"`
+	Version            string   `json:"version"`
+	Listen             string   `json:"listen"`
+	STUN               bool     `json:"stun"`
+	Mesh               bool     `json:"mesh"`
+	Metrics            string   `json:"metrics"`
+	Health             string   `json:"health"`
+	TrafficPersist     bool     `json:"trafficPersist"`
+	TrafficPath        string   `json:"trafficPath,omitempty"`
+	TrafficInterval    int      `json:"trafficInterval,omitempty"`
+	Error              string   `json:"error,omitempty"`
+	Clients            int      `json:"clients"`
+	Accepts            int64    `json:"accepts"`
+	BytesRecv          int64    `json:"bytesRecv"`
+	BytesSent          int64    `json:"bytesSent"`
+	AcceptsTotal       int64    `json:"acceptsTotal,omitempty"`
+	BytesRecvTotal     int64    `json:"bytesRecvTotal,omitempty"`
+	BytesSentTotal     int64    `json:"bytesSentTotal,omitempty"`
 }
 
 type ActionResult struct {
@@ -84,18 +88,23 @@ func StatusFromConfig(cfg Config, snapshot Snapshot, mf MetricsFunc, tf TrafficF
 	}
 
 	s := Status{
-		VerifyClients: cfg.VerifyClientURLs,
-		Running:       running,
-		Version:       cfg.Version,
-		Listen:        cfg.Listen,
-		STUN:          cfg.STUN,
-		Mesh:          cfg.Mesh,
-		Metrics:       metricsAddr,
-		Health:        healthAddr,
-		TrafficPersist: cfg.TrafficPersist,
-		TrafficPath:    cfg.TrafficPath,
-		TrafficInterval: cfg.TrafficInterval,
-		Error:         errMsg,
+		VerifyClients:      cfg.Verify.URLs,
+		VerifyEnabled:      cfg.Verify.Enabled,
+		VerifyURLsEnabled:  cfg.Verify.URLsEnabled,
+		VerifyTailscaled:   cfg.Verify.TailscaledEnabled,
+		VerifyAPIEnabled:   cfg.Verify.APIEnabled,
+		VerifyAPIInstances: len(cfg.Verify.APIs),
+		Running:            running,
+		Version:            cfg.Version,
+		Listen:             cfg.Listen,
+		STUN:               cfg.STUN,
+		Mesh:               cfg.Mesh,
+		Metrics:            metricsAddr,
+		Health:             healthAddr,
+		TrafficPersist:     cfg.TrafficPersist,
+		TrafficPath:        cfg.TrafficPath,
+		TrafficInterval:    cfg.TrafficInterval,
+		Error:              errMsg,
 	}
 
 	if mf != nil {
@@ -196,61 +205,15 @@ func HandleVersion(version string) http.HandlerFunc {
 	}
 }
 
-// HandleVerify implements a multi-URL admission controller.
-// It accepts POST requests with ?key=<node-public-key>.
-// Returns 200 if any URL accepts, 403 if any explicitly rejects.
-// Falls back to fail-open policy on network errors.
+// HandleVerify is retained as a compatibility wrapper for callers that only
+// configure Verify URLs. The failOpen argument is intentionally ignored.
 func HandleVerify(urls []string, failOpen bool, t *tracker.PeerTracker) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			httpjson.Write(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
-			return
-		}
-
-		clientKey := r.URL.Query().Get("key")
-		if clientKey == "" {
-			httpjson.Write(w, http.StatusBadRequest, map[string]string{"error": "key parameter required"})
-			return
-		}
-
-		if len(urls) == 0 {
-			if t != nil {
-				t.Add(clientKey, r.RemoteAddr)
-			}
-			httpjson.Write(w, http.StatusOK, map[string]string{"result": "accepted", "reason": "no verify URLs configured"})
-			return
-		}
-
-		var lastErr error
-		for _, verifyURL := range urls {
-			err := checkVerifyURL(verifyURL, clientKey)
-			if err == nil {
-				if t != nil {
-					t.Add(clientKey, r.RemoteAddr)
-				}
-				httpjson.Write(w, http.StatusOK, map[string]string{"result": "accepted"})
-				return
-			}
-			if err != errVerifyNetwork {
-				httpjson.Write(w, http.StatusForbidden, map[string]string{"result": "rejected", "error": err.Error()})
-				return
-			}
-			lastErr = err
-		}
-
-		if failOpen {
-			if t != nil {
-				t.Add(clientKey, r.RemoteAddr)
-			}
-			httpjson.Write(w, http.StatusOK, map[string]string{"result": "accepted", "reason": "fail-open"})
-			return
-		}
-
-		httpjson.Write(w, http.StatusForbidden, map[string]string{
-			"result": "rejected",
-			"error":  fmt.Sprintf("all verify URLs unreachable: %v", lastErr),
-		})
-	}
+	_ = failOpen
+	return handleVerify(newVerifier(VerifyConfig{
+		Enabled:     true,
+		URLsEnabled: true,
+		URLs:        urls,
+	}, t))
 }
 
 var errVerifyNetwork = fmt.Errorf("network error")
@@ -323,7 +286,10 @@ func NewMux(cfg Config, snapshot Snapshot, executor Executor, mf MetricsFunc, t 
 	mux.HandleFunc("/version", HandleVersion(cfg.Version))
 	mux.HandleFunc("/ops", HandleOpsWithExecutor(executor))
 
-	mux.HandleFunc("/verify", HandleVerify(cfg.VerifyClientURLs, cfg.VerifyClientFailOpen, t))
+	verifier := newVerifier(cfg.Verify, t)
+	mux.HandleFunc("/verify", handleVerify(verifier))
+	mux.HandleFunc("/devices", handleDevices(verifier))
+	mux.HandleFunc("/devices/refresh", handleDevicesRefresh(verifier))
 
 	if t != nil {
 		mux.HandleFunc("/peers", HandlePeers(t))

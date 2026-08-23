@@ -1,11 +1,11 @@
 package main
 
 import (
-	"encoding/json"
 	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"expvar"
 	"flag"
 	"fmt"
@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,32 +22,38 @@ import (
 	"github.com/LazuliKao/tailscale-derp/internal/httpjson"
 	opsapi "github.com/LazuliKao/tailscale-derp/internal/ops"
 	"github.com/LazuliKao/tailscale-derp/internal/service"
-	"github.com/LazuliKao/tailscale-derp/internal/traffic"
 	"github.com/LazuliKao/tailscale-derp/internal/tracker"
+	"github.com/LazuliKao/tailscale-derp/internal/traffic"
 
 	"tailscale.com/derp/derpserver"
 	"tailscale.com/net/stunserver"
 	"tailscale.com/types/key"
 )
+
 var version = "dev"
 var getServerMetrics opsapi.MetricsFunc
+
 const (
-	defaultNodeKeyPath   = "/var/lib/tailscale-derp/node.key"
-	defaultListenAddr    = ":3478"
-	defaultOpsAddr       = "127.0.0.1:9911"
-	defaultHealthAddr    = ":9912"
-	defaultTrafficPath   = "/tmp/tailscale-derp-traffic.json"
+	defaultNodeKeyPath     = "/var/lib/tailscale-derp/node.key"
+	defaultAPISecretsPath  = "/etc/config/tailscale-derp-secrets"
+	defaultListenAddr      = ":3478"
+	defaultOpsAddr         = "127.0.0.1:9911"
+	defaultHealthAddr      = ":9912"
+	defaultTrafficPath     = "/tmp/tailscale-derp-traffic.json"
 	defaultTrafficInterval = 60
-	serviceActionTimeout = 15 * time.Second
-	opsReadHeaderTimeout = 5 * time.Second
-	opsReadTimeout       = 15 * time.Second
-	opsWriteTimeout      = 15 * time.Second
-	opsIdleTimeout       = 30 * time.Second
+	serviceActionTimeout   = 15 * time.Second
+	opsReadHeaderTimeout   = 5 * time.Second
+	opsReadTimeout         = 15 * time.Second
+	opsWriteTimeout        = 15 * time.Second
+	opsIdleTimeout         = 30 * time.Second
 )
 
 type Config struct {
+	// VerifyClientURLs and VerifyClientFailOpen are retained for source
+	// compatibility with older callers. Verification uses Verify instead.
 	VerifyClientURLs     []string
 	VerifyClientFailOpen bool
+	Verify               opsapi.VerifyConfig
 	Enabled              bool
 	Listen               string
 	STUN                 bool
@@ -100,23 +107,31 @@ func (s *runtimeState) snapshot() (bool, string) {
 type configFlags struct {
 	VerifyClientURLs     *string
 	VerifyClientFailOpen *bool
-	Enabled    *bool
-	Listen     *string
-	STUN       *bool
-	CertFile   *string
-	KeyFile    *string
-	Mesh       *bool
-	MeshKey    *string
-	OpsAddr    *string
-	HealthAddr *string
-	TrafficPersist  *bool
-	TrafficPath     *string
-	TrafficInterval *int
-	ConfigPath *string
+	Enabled              *bool
+	Listen               *string
+	STUN                 *bool
+	CertFile             *string
+	KeyFile              *string
+	Mesh                 *bool
+	MeshKey              *string
+	OpsAddr              *string
+	HealthAddr           *string
+	TrafficPersist       *bool
+	TrafficPath          *string
+	TrafficInterval      *int
+	ConfigPath           *string
+}
+
+type uciSection struct {
+	typ    string
+	name   string
+	values map[string][]string
 }
 
 type uciConfig struct {
-	values map[string]map[string][]string
+	// values preserves the original lookup API used by existing code/tests.
+	values   map[string]map[string][]string
+	sections []uciSection
 }
 
 type actionExecutor = opsapi.Executor
@@ -151,20 +166,20 @@ func newFlagSet(args []string) (*flag.FlagSet, *configFlags, error) {
 	fs.SetOutput(os.Stderr)
 	flags := &configFlags{
 		VerifyClientURLs:     fs.String("verify-client-urls", "", "comma-separated admission controller URLs for verifying clients"),
-		VerifyClientFailOpen: fs.Bool("verify-client-fail-open", false, "allow clients if admission controller is unreachable"),
-		Enabled:    fs.Bool("enabled", false, "enable DERP service"),
-		Listen:     fs.String("listen", "", "listen address"),
-		STUN:       fs.Bool("stun", false, "enable STUN"),
-		CertFile:   fs.String("certfile", "", "TLS certificate file"),
-		KeyFile:    fs.String("keyfile", "", "TLS key file"),
-		Mesh:       fs.Bool("mesh", false, "enable mesh mode"),
-		MeshKey:    fs.String("mesh-key", "", "shared mesh key"),
-		OpsAddr:    fs.String("ops", "", "ops server address"),
-		HealthAddr: fs.String("health", "", "health server address"),
-		TrafficPersist:  fs.Bool("traffic-persist", false, "enable traffic statistics persistence"),
-		TrafficPath:     fs.String("traffic-path", "", "path to traffic statistics file"),
-		TrafficInterval: fs.Int("traffic-interval", 0, "traffic save interval in seconds"),
-		ConfigPath: fs.String("config", defaultConfigPath(), "UCI config path"),
+		VerifyClientFailOpen: fs.Bool("verify-client-fail-open", false, "deprecated and ignored; verification never fails open"),
+		Enabled:              fs.Bool("enabled", false, "enable DERP service"),
+		Listen:               fs.String("listen", "", "listen address"),
+		STUN:                 fs.Bool("stun", false, "enable STUN"),
+		CertFile:             fs.String("certfile", "", "TLS certificate file"),
+		KeyFile:              fs.String("keyfile", "", "TLS key file"),
+		Mesh:                 fs.Bool("mesh", false, "enable mesh mode"),
+		MeshKey:              fs.String("mesh-key", "", "shared mesh key"),
+		OpsAddr:              fs.String("ops", "", "ops server address"),
+		HealthAddr:           fs.String("health", "", "health server address"),
+		TrafficPersist:       fs.Bool("traffic-persist", false, "enable traffic statistics persistence"),
+		TrafficPath:          fs.String("traffic-path", "", "path to traffic statistics file"),
+		TrafficInterval:      fs.Int("traffic-interval", 0, "traffic save interval in seconds"),
+		ConfigPath:           fs.String("config", defaultConfigPath(), "UCI config path"),
 	}
 
 	if err := fs.Parse(args); err != nil {
@@ -180,6 +195,14 @@ func defaultConfigPath() string {
 	}
 
 	return "/etc/config/tailscale-derp"
+}
+
+func defaultAPISecretsConfigPath() string {
+	if path := os.Getenv("GO_TAILSCALE_DERP_SECRETS"); path != "" {
+		return path
+	}
+
+	return defaultAPISecretsPath
 }
 
 func validateOptionalPortBinding(name, value string) error {
@@ -216,6 +239,7 @@ func parseUCIConfig(path string) (*uciConfig, error) {
 	parsed := &uciConfig{values: make(map[string]map[string][]string)}
 	scanner := bufio.NewScanner(file)
 	currentSection := ""
+	currentType := ""
 
 	for lineNum := 1; scanner.Scan(); lineNum++ {
 		line := strings.TrimSpace(scanner.Text())
@@ -233,8 +257,15 @@ func parseUCIConfig(path string) (*uciConfig, error) {
 			if len(fields) < 3 {
 				return nil, fmt.Errorf("invalid config declaration on line %d", lineNum)
 			}
+			currentType = trimQuotes(fields[1])
 			currentSection = trimQuotes(fields[2])
-			parsed.values[currentSection] = make(map[string][]string)
+			sectionValues := make(map[string][]string)
+			parsed.values[currentSection] = sectionValues
+			parsed.sections = append(parsed.sections, uciSection{
+				typ:    currentType,
+				name:   currentSection,
+				values: sectionValues,
+			})
 		case "option":
 			if currentSection == "" || len(fields) < 3 {
 				return nil, fmt.Errorf("invalid option declaration on line %d", lineNum)
@@ -286,13 +317,17 @@ func buildConfig(args []string, openFile func(string) (*uciConfig, error)) (*Con
 	}
 
 	cfg := &Config{
-		Enabled: false,
-		Listen:  defaultListenAddr,
-		STUN:    true,
-		OpsAddr: defaultOpsAddr,
-		Health:  defaultHealthAddr,
-		TrafficPath: defaultTrafficPath,
+		Enabled:         false,
+		Listen:          defaultListenAddr,
+		STUN:            true,
+		OpsAddr:         defaultOpsAddr,
+		Health:          defaultHealthAddr,
+		TrafficPath:     defaultTrafficPath,
 		TrafficInterval: defaultTrafficInterval,
+		Verify: opsapi.VerifyConfig{
+			SyncInterval: 5 * time.Minute,
+			CacheTTL:     15 * time.Minute,
+		},
 	}
 
 	if flags.ConfigPath != nil && *flags.ConfigPath != "" {
@@ -401,13 +436,78 @@ func applyUCIConfig(cfg *Config, parsed *uciConfig) error {
 		}
 	}
 	cfg.VerifyClientURLs = verifyURLs
+	cfg.Verify.URLs = append([]string(nil), verifyURLs...)
 
-	if value, ok := parsed.first("verify", "fail_open"); ok {
+	verifyEnabledSet := false
+	if value, ok := parsed.first("verify", "enabled"); ok {
 		parsedBool, err := parseBoolValue(value)
 		if err != nil {
-			return fmt.Errorf("verify.fail_open: %w", err)
+			return fmt.Errorf("verify.enabled: %w", err)
 		}
-		cfg.VerifyClientFailOpen = parsedBool
+		cfg.Verify.Enabled = parsedBool
+		verifyEnabledSet = true
+	}
+
+	urlEnabledSet := false
+	if value, ok := parsed.first("verify", "url_enabled"); ok {
+		parsedBool, err := parseBoolValue(value)
+		if err != nil {
+			return fmt.Errorf("verify.url_enabled: %w", err)
+		}
+		cfg.Verify.URLsEnabled = parsedBool
+		urlEnabledSet = true
+	}
+	if value, ok := parsed.first("verify", "tailscaled_enabled"); ok {
+		parsedBool, err := parseBoolValue(value)
+		if err != nil {
+			return fmt.Errorf("verify.tailscaled_enabled: %w", err)
+		}
+		cfg.Verify.TailscaledEnabled = parsedBool
+	}
+	if value, ok := parsed.first("verify", "api_enabled"); ok {
+		parsedBool, err := parseBoolValue(value)
+		if err != nil {
+			return fmt.Errorf("verify.api_enabled: %w", err)
+		}
+		cfg.Verify.APIEnabled = parsedBool
+	}
+
+	if value, ok := parsed.first("verify", "sync_interval"); ok && value != "" {
+		seconds, err := strconv.Atoi(value)
+		if err != nil || seconds <= 0 {
+			return fmt.Errorf("verify.sync_interval: must be a positive number")
+		}
+		cfg.Verify.SyncInterval = time.Duration(seconds) * time.Second
+	}
+	if value, ok := parsed.first("verify", "cache_ttl"); ok && value != "" {
+		seconds, err := strconv.Atoi(value)
+		if err != nil || seconds <= 0 {
+			return fmt.Errorf("verify.cache_ttl: must be a positive number")
+		}
+		cfg.Verify.CacheTTL = time.Duration(seconds) * time.Second
+	}
+
+	for _, section := range parsed.sectionsOfType("verify_api") {
+		tailnet := firstSectionValue(section, "tailnet")
+		if tailnet == "" {
+			tailnet = "-"
+		}
+		cfg.Verify.APIs = append(cfg.Verify.APIs, opsapi.APIConfig{
+			Name:    section.name,
+			Label:   firstSectionValue(section, "label"),
+			Tailnet: tailnet,
+		})
+	}
+
+	// Existing URL-only configurations remain active without requiring a
+	// manual migration. New configurations have no URL and stay disabled.
+	if len(verifyURLs) > 0 {
+		if !verifyEnabledSet {
+			cfg.Verify.Enabled = true
+		}
+		if !urlEnabledSet {
+			cfg.Verify.URLsEnabled = true
+		}
 	}
 
 	return nil
@@ -437,6 +537,27 @@ func (u *uciConfig) get(section, key string) []string {
 		return nil
 	}
 	return sectionValues[key]
+}
+
+func (u *uciConfig) sectionsOfType(sectionType string) []uciSection {
+	if u == nil {
+		return nil
+	}
+	var sections []uciSection
+	for _, section := range u.sections {
+		if section.typ == sectionType {
+			sections = append(sections, section)
+		}
+	}
+	return sections
+}
+
+func firstSectionValue(section uciSection, key string) string {
+	values := section.values[key]
+	if len(values) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(values[0])
 }
 
 func applyFlagOverrides(cfg *Config, fs *flag.FlagSet, flags *configFlags) {
@@ -481,16 +602,61 @@ func applyFlagOverrides(cfg *Config, fs *flag.FlagSet, flags *configFlags) {
 			trimmed := strings.TrimSpace(part)
 			if trimmed != "" {
 				cfg.VerifyClientURLs = append(cfg.VerifyClientURLs, trimmed)
+				cfg.Verify.URLs = append(cfg.Verify.URLs, trimmed)
 			}
 		}
+		cfg.Verify.Enabled = true
+		cfg.Verify.URLsEnabled = true
 	}
 	if boolFlagProvided(fs, "verify-client-fail-open") {
-		cfg.VerifyClientFailOpen = *flags.VerifyClientFailOpen
+		// Kept only so older service invocations remain accepted. Fail-open is
+		// intentionally no longer applied to any verification mechanism.
+		cfg.VerifyClientFailOpen = false
 	}
 }
 
 func loadConfig() (*Config, error) {
-	return buildConfig(os.Args[1:], parseUCIConfig)
+	cfg, err := buildConfig(os.Args[1:], parseUCIConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	secrets, err := loadAPISecrets(defaultAPISecretsConfigPath())
+	if err != nil {
+		return nil, err
+	}
+	for i := range cfg.Verify.APIs {
+		cfg.Verify.APIs[i].APIKey = secrets[cfg.Verify.APIs[i].Name]
+	}
+
+	return cfg, nil
+}
+
+func loadAPISecrets(path string) (map[string]string, error) {
+	secrets := make(map[string]string)
+	parsed, err := parseUCIConfig(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return secrets, nil
+		}
+		return nil, fmt.Errorf("load API secrets: %w", err)
+	}
+
+	if info, err := os.Stat(path); err != nil {
+		return nil, fmt.Errorf("stat API secrets: %w", err)
+	} else if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("API secrets file must not be readable by group or others")
+	}
+
+	for _, section := range parsed.sectionsOfType("secret") {
+		name := strings.TrimSpace(section.name)
+		apiKey := firstSectionValue(section, "api_key")
+		if name != "" && apiKey != "" {
+			secrets[name] = apiKey
+		}
+	}
+
+	return secrets, nil
 }
 
 func validateConfig(cfg *Config) error {
@@ -539,7 +705,6 @@ func startDERP(cfg *Config, state *runtimeState, persister *traffic.Persister) e
 			return fmt.Errorf("parse mesh key: %w", err)
 		}
 	}
-	server.SetVerifyClient(true)
 	opsAddr := cfg.OpsAddr
 	if opsAddr == "" {
 		opsAddr = defaultOpsAddr
@@ -547,12 +712,16 @@ func startDERP(cfg *Config, state *runtimeState, persister *traffic.Persister) e
 	if strings.HasPrefix(opsAddr, ":") {
 		opsAddr = "127.0.0.1" + opsAddr
 	}
-	admissionURL := fmt.Sprintf("http://%s/verify", opsAddr)
-	server.SetVerifyClientURL(admissionURL)
-	if cfg.VerifyClientFailOpen {
-		server.SetVerifyClientURLFailOpen(true)
+	server.SetVerifyClient(false)
+	server.SetVerifyClientURLFailOpen(false)
+	if cfg.Verify.Enabled {
+		admissionURL := fmt.Sprintf("http://%s/verify", opsAddr)
+		server.SetVerifyClientURL(admissionURL)
+		log.Printf("Client verification enabled at %s (urls: %v, tailscaled: %v, official API: %v)", admissionURL, cfg.Verify.URLsEnabled, cfg.Verify.TailscaledEnabled, cfg.Verify.APIEnabled)
+	} else {
+		server.SetVerifyClientURL("")
+		log.Printf("Client verification disabled")
 	}
-	log.Printf("Verify-client always enabled for peer tracking, admission controller at %s (fail-open: %v, external URLs: %d)", admissionURL, cfg.VerifyClientFailOpen, len(cfg.VerifyClientURLs))
 	serverExpVar := publishDERPMetrics(server)
 	getServerMetrics = func() json.RawMessage {
 		return json.RawMessage(serverExpVar.String())
@@ -631,7 +800,6 @@ func publishDERPMetrics(server *derpserver.Server) expvar.Var {
 	}
 	return ev
 }
-
 
 func loadOrCreateNodeKey(path string) (key.NodePrivate, error) {
 	raw, err := os.ReadFile(path)
@@ -740,9 +908,12 @@ func statusFromConfigWithTraffic(cfg *Config, state *runtimeState, persister *tr
 }
 
 func opsConfig(cfg *Config) opsapi.Config {
+	verify := cfg.Verify
+	if len(verify.URLs) == 0 && len(cfg.VerifyClientURLs) > 0 {
+		verify.URLs = append([]string(nil), cfg.VerifyClientURLs...)
+	}
 	return opsapi.Config{
-		VerifyClientURLs:     cfg.VerifyClientURLs,
-		VerifyClientFailOpen: cfg.VerifyClientFailOpen,
+		Verify:          verify,
 		Version:         version,
 		Listen:          cfg.Listen,
 		STUN:            cfg.STUN,

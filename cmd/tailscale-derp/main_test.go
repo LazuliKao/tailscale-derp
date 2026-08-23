@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -714,5 +715,86 @@ func TestConfig_DefaultValues(t *testing.T) {
 	}
 	if cfg.CertFile != "" {
 		t.Fatal("expected CertFile to be empty by default")
+	}
+}
+
+func TestParseUCIConfig_RepeatedVerifyAPISections(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := tempDir + "/tailscale-derp"
+	content := `config verify 'verify'
+	option enabled '1'
+	option api_enabled '1'
+	list url 'https://admission.example/verify'
+
+config verify_api 'primary'
+	option label 'Primary'
+
+config verify_api 'secondary'
+	option label 'Secondary'
+	option tailnet 'T1234CNTRL'
+`
+	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	parsed, err := parseUCIConfig(configPath)
+	if err != nil {
+		t.Fatalf("parse config: %v", err)
+	}
+	cfg, err := buildConfig([]string{"--config", configPath}, func(string) (*uciConfig, error) {
+		return parsed, nil
+	})
+	if err != nil {
+		t.Fatalf("build config: %v", err)
+	}
+	if len(cfg.Verify.APIs) != 2 {
+		t.Fatalf("expected two API instances, got %d", len(cfg.Verify.APIs))
+	}
+	if cfg.Verify.APIs[0].Tailnet != "-" || cfg.Verify.APIs[1].Tailnet != "T1234CNTRL" {
+		t.Fatalf("unexpected API tailnets: %+v", cfg.Verify.APIs)
+	}
+	if cfg.Verify.APIs[0].APIKey != "" || cfg.Verify.APIs[1].APIKey != "" {
+		t.Fatalf("API keys must not be read from the main config: %+v", cfg.Verify.APIs)
+	}
+}
+
+func TestLoadAPISecrets(t *testing.T) {
+	tempDir := t.TempDir()
+	secretsPath := tempDir + "/tailscale-derp-secrets"
+	content := `config secret 'primary'
+	option api_key 'tskey-api-primary'
+
+config secret 'secondary'
+	option api_key 'tskey-api-secondary'
+`
+	if err := os.WriteFile(secretsPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write secrets: %v", err)
+	}
+	if err := os.Chmod(secretsPath, 0o600); err != nil {
+		t.Fatalf("protect secrets: %v", err)
+	}
+
+	secrets, err := loadAPISecrets(secretsPath)
+	if err != nil {
+		t.Fatalf("load secrets: %v", err)
+	}
+	if secrets["primary"] != "tskey-api-primary" || secrets["secondary"] != "tskey-api-secondary" {
+		t.Fatalf("unexpected secrets: %#v", secrets)
+	}
+}
+
+func TestLoadAPISecretsRejectsBroadPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not preserve POSIX file permission bits")
+	}
+
+	tempDir := t.TempDir()
+	secretsPath := tempDir + "/tailscale-derp-secrets"
+	if err := os.WriteFile(secretsPath, []byte("config secret 'primary'\noption api_key 'secret'\n"), 0o644); err != nil {
+		t.Fatalf("write secrets: %v", err)
+	}
+
+	if _, err := loadAPISecrets(secretsPath); err == nil {
+		t.Fatal("expected broad permissions to be rejected")
 	}
 }
