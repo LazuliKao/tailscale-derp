@@ -70,6 +70,23 @@ func TestVerifierCombinesMechanismsWithOR(t *testing.T) {
 	}
 }
 
+func TestNewVerifierUsesConfiguredTailscaledSocketOnlyWhenEnabled(t *testing.T) {
+	const socket = "/tmp/custom-tailscaled.sock"
+
+	defaultVerifier := newVerifier(VerifyConfig{TailscaledSocket: socket}, nil)
+	if defaultVerifier.local.Socket != "" {
+		t.Fatalf("expected default socket when custom socket is disabled, got %q", defaultVerifier.local.Socket)
+	}
+
+	customVerifier := newVerifier(VerifyConfig{
+		TailscaledSocketEnabled: true,
+		TailscaledSocket:        socket,
+	}, nil)
+	if customVerifier.local.Socket != socket {
+		t.Fatalf("expected custom socket %q, got %q", socket, customVerifier.local.Socket)
+	}
+}
+
 func TestDeviceStoreRefreshFiltersAndAuthorizesDevices(t *testing.T) {
 	secret := "tskey-api-secret"
 	nodeKey := key.NewNode().Public()

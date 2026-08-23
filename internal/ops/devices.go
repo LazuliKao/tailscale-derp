@@ -36,14 +36,16 @@ type APIConfig struct {
 }
 
 type VerifyConfig struct {
-	Enabled           bool
-	URLsEnabled       bool
-	TailscaledEnabled bool
-	APIEnabled        bool
-	URLs              []string
-	APIs              []APIConfig
-	SyncInterval      time.Duration
-	CacheTTL          time.Duration
+	Enabled                 bool
+	URLsEnabled             bool
+	TailscaledEnabled       bool
+	TailscaledSocketEnabled bool
+	TailscaledSocket        string
+	APIEnabled              bool
+	URLs                    []string
+	APIs                    []APIConfig
+	SyncInterval            time.Duration
+	CacheTTL                time.Duration
 }
 
 type Device struct {
@@ -371,7 +373,11 @@ func newVerifier(cfg VerifyConfig, track *tracker.PeerTracker) *verifier {
 	cfg = normalizeVerifyConfig(cfg)
 	store := newDeviceStore(cfg)
 	store.start(context.Background())
-	return &verifier{cfg: cfg, local: &local.Client{}, store: store, track: track}
+	localClient := &local.Client{}
+	if cfg.TailscaledSocketEnabled {
+		localClient.Socket = cfg.TailscaledSocket
+	}
+	return &verifier{cfg: cfg, local: localClient, store: store, track: track}
 }
 
 func (v *verifier) verify(ctx context.Context, request tailcfg.DERPAdmitClientRequest, remoteAddr string) bool {

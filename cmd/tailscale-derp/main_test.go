@@ -85,6 +85,28 @@ func TestBuildConfig_AppliesUCIConfig(t *testing.T) {
 	}
 }
 
+func TestBuildConfig_AppliesCustomTailscaledSocketSettings(t *testing.T) {
+	parsed := &uciConfig{values: map[string]map[string][]string{
+		"verify": {
+			"tailscaled_socket_enabled": {"1"},
+			"tailscaled_socket":         {" /tmp/custom-tailscaled.sock "},
+		},
+	}}
+
+	cfg, err := buildConfig([]string{"--config", "test.conf"}, func(string) (*uciConfig, error) {
+		return parsed, nil
+	})
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if !cfg.Verify.TailscaledSocketEnabled {
+		t.Fatal("expected custom tailscaled socket to be enabled")
+	}
+	if cfg.Verify.TailscaledSocket != "/tmp/custom-tailscaled.sock" {
+		t.Fatalf("unexpected custom tailscaled socket: %q", cfg.Verify.TailscaledSocket)
+	}
+}
+
 func TestBuildConfig_FlagOverridesUCI(t *testing.T) {
 	parsed := &uciConfig{values: map[string]map[string][]string{
 		"global": {

@@ -464,6 +464,16 @@ func applyUCIConfig(cfg *Config, parsed *uciConfig) error {
 		}
 		cfg.Verify.TailscaledEnabled = parsedBool
 	}
+	if value, ok := parsed.first("verify", "tailscaled_socket_enabled"); ok {
+		parsedBool, err := parseBoolValue(value)
+		if err != nil {
+			return fmt.Errorf("verify.tailscaled_socket_enabled: %w", err)
+		}
+		cfg.Verify.TailscaledSocketEnabled = parsedBool
+	}
+	if value, ok := parsed.first("verify", "tailscaled_socket"); ok {
+		cfg.Verify.TailscaledSocket = strings.TrimSpace(value)
+	}
 	if value, ok := parsed.first("verify", "api_enabled"); ok {
 		parsedBool, err := parseBoolValue(value)
 		if err != nil {
