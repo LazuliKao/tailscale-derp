@@ -26,13 +26,37 @@ const (
 	deviceAPIBaseURL          = "https://api.tailscale.com"
 )
 
-// APIConfig identifies one Tailscale Official API tailnet. APIKey is kept in
-// memory only and is never included in status or device responses.
+type APIAuthType string
+
+const (
+	APIAuthTypeAPIKey APIAuthType = "api_key"
+	APIAuthTypeOAuth  APIAuthType = "oauth"
+)
+
+// APIConfig identifies one Tailscale Official API tailnet. Credentials are
+// kept in memory only and are never included in status or device responses.
 type APIConfig struct {
-	Name    string
-	Label   string
-	Tailnet string
-	APIKey  string
+	Name              string
+	Label             string
+	Tailnet           string
+	AuthType          APIAuthType
+	APIKey            string
+	OAuthClientID     string
+	OAuthClientSecret string
+}
+
+func (c APIConfig) isConfigured() bool {
+	if strings.TrimSpace(c.Tailnet) == "" {
+		return false
+	}
+	switch c.AuthType {
+	case APIAuthTypeOAuth:
+		return strings.TrimSpace(c.OAuthClientID) != "" && strings.TrimSpace(c.OAuthClientSecret) != ""
+	case "", APIAuthTypeAPIKey:
+		return strings.TrimSpace(c.APIKey) != ""
+	default:
+		return false
+	}
 }
 
 type VerifyConfig struct {
@@ -72,6 +96,7 @@ type DeviceSyncStatus struct {
 	Name        string `json:"name,omitempty"`
 	Label       string `json:"label,omitempty"`
 	Tailnet     string `json:"tailnet,omitempty"`
+	AuthType    string `json:"authType,omitempty"`
 	Configured  bool   `json:"configured"`
 	Fresh       bool   `json:"fresh"`
 	LastAttempt string `json:"lastAttempt,omitempty"`
@@ -121,6 +146,9 @@ func newDeviceStore(cfg VerifyConfig) *deviceStore {
 		if strings.TrimSpace(configs[i].Tailnet) == "" {
 			configs[i].Tailnet = "-"
 		}
+		if configs[i].AuthType == "" {
+			configs[i].AuthType = APIAuthTypeAPIKey
+		}
 	}
 	for _, instance := range configs {
 		cache[instance.Name] = deviceCache{devices: map[string]Device{}}
@@ -160,8 +188,8 @@ func (s *deviceStore) refresh(ctx context.Context) error {
 
 	var firstErr error
 	for _, instance := range s.configs {
-		if strings.TrimSpace(instance.APIKey) == "" || strings.TrimSpace(instance.Tailnet) == "" {
-			s.recordFailure(instance.Name, errors.New("tailnet and API key are required"))
+		if !instance.isConfigured() {
+			s.recordFailure(instance.Name, errors.New("tailnet and selected API credentials are required"))
 			if firstErr == nil {
 				firstErr = errors.New("one or more API instances are not configured")
 			}
@@ -180,7 +208,7 @@ func (s *deviceStore) refreshInstance(ctx context.Context, instance APIConfig) e
 
 	rawDevices, err := s.apiClient(instance).Devices().List(ctx, tailscaleapi.WithFields(tailscaleapi.IncludeFieldsDefault))
 	if err != nil {
-		s.recordFailure(instance.Name, err)
+		s.recordFailure(instance.Name, errors.New("Tailscale API request failed"))
 		return err
 	}
 
@@ -207,12 +235,20 @@ func (s *deviceStore) apiClient(instance APIConfig) *tailscaleapi.Client {
 	client := s.client
 	baseURL := s.baseURL
 	s.mu.RUnlock()
-	return &tailscaleapi.Client{
-		APIKey:  instance.APIKey,
+	apiClient := &tailscaleapi.Client{
 		BaseURL: baseURL,
 		HTTP:    client,
 		Tailnet: instance.Tailnet,
 	}
+	if instance.AuthType == APIAuthTypeOAuth {
+		apiClient.Auth = &tailscaleapi.OAuth{
+			ClientID:     instance.OAuthClientID,
+			ClientSecret: instance.OAuthClientSecret,
+		}
+	} else {
+		apiClient.APIKey = instance.APIKey
+	}
+	return apiClient
 }
 
 func sanitizeDevice(raw tailscaleapi.Device, instance APIConfig) Device {
@@ -317,7 +353,8 @@ func (s *deviceStore) snapshot() DevicesResponse {
 			Name:        cfg.Name,
 			Label:       label,
 			Tailnet:     cfg.Tailnet,
-			Configured:  cfg.APIKey != "" && cfg.Tailnet != "",
+			AuthType:    string(cfg.AuthType),
+			Configured:  cfg.isConfigured(),
 			Fresh:       !entry.lastSuccess.IsZero() && now.Sub(entry.lastSuccess) <= s.ttl,
 			DeviceCount: len(entry.devices),
 			Error:       entry.err,

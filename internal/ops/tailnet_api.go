@@ -25,6 +25,7 @@ type APIInstance struct {
 	Name       string `json:"name"`
 	Label      string `json:"label,omitempty"`
 	Tailnet    string `json:"tailnet"`
+	AuthType   string `json:"authType,omitempty"`
 	Configured bool   `json:"configured"`
 }
 
@@ -48,7 +49,8 @@ func (s *deviceStore) apiInstances() []APIInstance {
 			Name:       cfg.Name,
 			Label:      label,
 			Tailnet:    cfg.Tailnet,
-			Configured: strings.TrimSpace(cfg.APIKey) != "" && strings.TrimSpace(cfg.Tailnet) != "",
+			AuthType:   string(cfg.AuthType),
+			Configured: cfg.isConfigured(),
 		})
 	}
 	return instances
@@ -59,7 +61,7 @@ func (s *deviceStore) apiInstance(name string) (APIConfig, error) {
 		if instance.Name != name {
 			continue
 		}
-		if strings.TrimSpace(instance.APIKey) == "" || strings.TrimSpace(instance.Tailnet) == "" {
+		if !instance.isConfigured() {
 			return APIConfig{}, errUnconfiguredAPIInstance
 		}
 		return instance, nil

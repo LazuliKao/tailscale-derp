@@ -126,6 +126,64 @@ func TestDeviceStoreRefreshFiltersAndAuthorizesDevices(t *testing.T) {
 	}
 }
 
+func TestDeviceStoreRefreshUsesOAuthClientCredentials(t *testing.T) {
+	const clientID = "client-id"
+	const clientSecret = "client-secret"
+	const accessToken = "access-token"
+	nodeKey := key.NewNode().Public()
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/oauth/token":
+			username, password, ok := r.BasicAuth()
+			if !ok {
+				username = r.FormValue("client_id")
+				password = r.FormValue("client_secret")
+			}
+			if username != clientID || password != clientSecret {
+				t.Fatalf("unexpected OAuth client authentication: username=%q password=%q present=%v", username, password, ok)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(map[string]any{"access_token": accessToken, "token_type": "Bearer", "expires_in": 3600}); err != nil {
+				t.Fatalf("write OAuth response: %v", err)
+			}
+		case "/api/v2/tailnet/-/devices":
+			if authorization := r.Header.Get("Authorization"); authorization != "Bearer "+accessToken {
+				t.Fatalf("unexpected OAuth access authentication: %q", authorization)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"devices": []map[string]any{
+				{"nodeId": "node-1", "nodeKey": nodeKey.String(), "name": "allowed", "authorized": true},
+			}})
+		default:
+			t.Fatalf("unexpected API path: %s", r.URL.Path)
+		}
+	}))
+	defer api.Close()
+
+	store := newDeviceStore(VerifyConfig{APIs: []APIConfig{{
+		Name:              "primary",
+		Tailnet:           "-",
+		AuthType:          APIAuthTypeOAuth,
+		OAuthClientID:     clientID,
+		OAuthClientSecret: clientSecret,
+	}}})
+	store.setHTTPClientForTest(api.Client(), api.URL)
+	if err := store.refresh(context.Background()); err != nil {
+		t.Fatalf("refresh failed: %v", err)
+	}
+	if !store.allowed(nodeKey, time.Now()) {
+		t.Fatal("expected OAuth-authorized device to be allowed")
+	}
+	encoded, err := json.Marshal(store.snapshot())
+	if err != nil {
+		t.Fatalf("marshal device response: %v", err)
+	}
+	for _, credential := range []string{clientID, clientSecret, accessToken} {
+		if strings.Contains(string(encoded), credential) {
+			t.Fatalf("credential leaked in device response: %q", credential)
+		}
+	}
+}
+
 func TestDeviceStoreExpiredCacheDoesNotAuthorize(t *testing.T) {
 	nodeKey := key.NewNode().Public()
 	store := &deviceStore{

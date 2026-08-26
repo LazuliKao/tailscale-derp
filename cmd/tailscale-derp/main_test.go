@@ -11,6 +11,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	opsapi "github.com/LazuliKao/tailscale-derp/internal/ops"
 )
 
 // --- validateConfig tests ---
@@ -775,8 +777,11 @@ config verify_api 'secondary'
 	if cfg.Verify.APIs[0].Tailnet != "-" || cfg.Verify.APIs[1].Tailnet != "T1234CNTRL" {
 		t.Fatalf("unexpected API tailnets: %+v", cfg.Verify.APIs)
 	}
-	if cfg.Verify.APIs[0].APIKey != "" || cfg.Verify.APIs[1].APIKey != "" {
-		t.Fatalf("API keys must not be read from the main config: %+v", cfg.Verify.APIs)
+	if cfg.Verify.APIs[0].AuthType != opsapi.APIAuthTypeAPIKey || cfg.Verify.APIs[1].AuthType != opsapi.APIAuthTypeAPIKey {
+		t.Fatalf("expected API key authentication default: %+v", cfg.Verify.APIs)
+	}
+	if cfg.Verify.APIs[0].APIKey != "" || cfg.Verify.APIs[1].APIKey != "" || cfg.Verify.APIs[0].OAuthClientID != "" || cfg.Verify.APIs[1].OAuthClientSecret != "" {
+		t.Fatalf("credentials must not be read from the main config: %+v", cfg.Verify.APIs)
 	}
 }
 
@@ -787,7 +792,8 @@ func TestLoadAPISecrets(t *testing.T) {
 	option api_key 'tskey-api-primary'
 
 config secret 'secondary'
-	option api_key 'tskey-api-secondary'
+	option oauth_client_id 'client-id-secondary'
+	option oauth_client_secret 'client-secret-secondary'
 `
 	if err := os.WriteFile(secretsPath, []byte(content), 0o600); err != nil {
 		t.Fatalf("write secrets: %v", err)
@@ -800,8 +806,46 @@ config secret 'secondary'
 	if err != nil {
 		t.Fatalf("load secrets: %v", err)
 	}
-	if secrets["primary"] != "tskey-api-primary" || secrets["secondary"] != "tskey-api-secondary" {
+	if secrets["primary"].APIKey != "tskey-api-primary" || secrets["secondary"].OAuthClientID != "client-id-secondary" || secrets["secondary"].OAuthClientSecret != "client-secret-secondary" {
 		t.Fatalf("unexpected secrets: %#v", secrets)
+	}
+}
+
+func TestParseUCIConfig_OAuthAPIInstance(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := tempDir + "/tailscale-derp"
+	content := `config verify_api 'primary'
+	option auth_type 'oauth'
+	option tailnet 'T1234CNTRL'
+`
+	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	parsed, err := parseUCIConfig(configPath)
+	if err != nil {
+		t.Fatalf("parse config: %v", err)
+	}
+	cfg, err := buildConfig([]string{"--config", configPath}, func(string) (*uciConfig, error) {
+		return parsed, nil
+	})
+	if err != nil {
+		t.Fatalf("build config: %v", err)
+	}
+	if len(cfg.Verify.APIs) != 1 || cfg.Verify.APIs[0].AuthType != opsapi.APIAuthTypeOAuth {
+		t.Fatalf("expected OAuth API instance, got %+v", cfg.Verify.APIs)
+	}
+}
+
+func TestParseUCIConfig_RejectsInvalidAPIAuthType(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := tempDir + "/tailscale-derp"
+	if err := os.WriteFile(configPath, []byte("config verify_api 'primary'\n\toption auth_type 'oidc'\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	if _, err := buildConfig([]string{"--config", configPath}, parseUCIConfig); err == nil {
+		t.Fatal("expected invalid API authentication type to be rejected")
 	}
 }
 

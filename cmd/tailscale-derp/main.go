@@ -502,10 +502,18 @@ func applyUCIConfig(cfg *Config, parsed *uciConfig) error {
 		if tailnet == "" {
 			tailnet = "-"
 		}
+		authType := opsapi.APIAuthTypeAPIKey
+		if value, ok := section.values["auth_type"]; ok && len(value) > 0 && strings.TrimSpace(value[0]) != "" {
+			authType = opsapi.APIAuthType(strings.TrimSpace(value[0]))
+		}
+		if authType != opsapi.APIAuthTypeAPIKey && authType != opsapi.APIAuthTypeOAuth {
+			return fmt.Errorf("verify_api.%s.auth_type: must be api_key or oauth", section.name)
+		}
 		cfg.Verify.APIs = append(cfg.Verify.APIs, opsapi.APIConfig{
-			Name:    section.name,
-			Label:   firstSectionValue(section, "label"),
-			Tailnet: tailnet,
+			Name:     section.name,
+			Label:    firstSectionValue(section, "label"),
+			Tailnet:  tailnet,
+			AuthType: authType,
 		})
 	}
 
@@ -636,14 +644,23 @@ func loadConfig() (*Config, error) {
 		return nil, err
 	}
 	for i := range cfg.Verify.APIs {
-		cfg.Verify.APIs[i].APIKey = secrets[cfg.Verify.APIs[i].Name]
+		credentials := secrets[cfg.Verify.APIs[i].Name]
+		cfg.Verify.APIs[i].APIKey = credentials.APIKey
+		cfg.Verify.APIs[i].OAuthClientID = credentials.OAuthClientID
+		cfg.Verify.APIs[i].OAuthClientSecret = credentials.OAuthClientSecret
 	}
 
 	return cfg, nil
 }
 
-func loadAPISecrets(path string) (map[string]string, error) {
-	secrets := make(map[string]string)
+type apiCredentials struct {
+	APIKey            string
+	OAuthClientID     string
+	OAuthClientSecret string
+}
+
+func loadAPISecrets(path string) (map[string]apiCredentials, error) {
+	secrets := make(map[string]apiCredentials)
 	parsed, err := parseUCIConfig(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -660,9 +677,12 @@ func loadAPISecrets(path string) (map[string]string, error) {
 
 	for _, section := range parsed.sectionsOfType("secret") {
 		name := strings.TrimSpace(section.name)
-		apiKey := firstSectionValue(section, "api_key")
-		if name != "" && apiKey != "" {
-			secrets[name] = apiKey
+		if name != "" {
+			secrets[name] = apiCredentials{
+				APIKey:            firstSectionValue(section, "api_key"),
+				OAuthClientID:     firstSectionValue(section, "oauth_client_id"),
+				OAuthClientSecret: firstSectionValue(section, "oauth_client_secret"),
+			}
 		}
 	}
 
