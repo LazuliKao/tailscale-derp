@@ -16,21 +16,16 @@ config verify 'verify'
 config verify_api 'primary'
 	option label 'Primary tailnet'
 	option tailnet '-'
-```
-
-Store the corresponding API key separately in
-`/etc/config/tailscale-derp-secrets`:
-
-```uci
-config secret 'primary'
+	option auth_type 'api_key'
 	option api_key 'tskey-api-...'
 ```
 
-On non-Windows systems the secrets file must not be readable by group or
-others (for example, `chmod 600 /etc/config/tailscale-derp-secrets`). The API
-key is used for device synchronization and for the loopback-only management
-endpoints below. Grant it only the Tailscale API permissions required by the
-operations you intend to use.
+For OAuth client credentials, store `oauth_client_id` and
+`oauth_client_secret` in the same `verify_api` section instead of `api_key`.
+Credentials are loaded into memory at startup and are never included in
+status or device responses. The API key is used for device synchronization and
+for the loopback-only management endpoints below. Grant it only the Tailscale
+API permissions required by the operations you intend to use.
 
 ## Tailnet management API
 

@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,7 +34,6 @@ var getServerMetrics opsapi.MetricsFunc
 
 const (
 	defaultNodeKeyPath     = "/var/lib/tailscale-derp/node.key"
-	defaultAPISecretsPath  = "/etc/config/tailscale-derp-secrets"
 	defaultListenAddr      = ":3478"
 	defaultOpsAddr         = "127.0.0.1:9911"
 	defaultHealthAddr      = ":9912"
@@ -197,14 +195,6 @@ func defaultConfigPath() string {
 	return "/etc/config/tailscale-derp"
 }
 
-func defaultAPISecretsConfigPath() string {
-	if path := os.Getenv("GO_TAILSCALE_DERP_SECRETS"); path != "" {
-		return path
-	}
-
-	return defaultAPISecretsPath
-}
-
 func validateOptionalPortBinding(name, value string) error {
 	if !strings.HasPrefix(value, ":") {
 		return nil
@@ -254,11 +244,23 @@ func parseUCIConfig(path string) (*uciConfig, error) {
 
 		switch fields[0] {
 		case "config":
-			if len(fields) < 3 {
+			if len(fields) < 2 {
 				return nil, fmt.Errorf("invalid config declaration on line %d", lineNum)
 			}
 			currentType = trimQuotes(fields[1])
-			currentSection = trimQuotes(fields[2])
+			currentSection = ""
+			if len(fields) >= 3 {
+				currentSection = trimQuotes(fields[2])
+			}
+			if currentSection == "" {
+				for index := 1; ; index++ {
+					candidate := fmt.Sprintf("%s_%d", currentType, index)
+					if _, exists := parsed.values[candidate]; !exists {
+						currentSection = candidate
+						break
+					}
+				}
+			}
 			sectionValues := make(map[string][]string)
 			parsed.values[currentSection] = sectionValues
 			parsed.sections = append(parsed.sections, uciSection{
@@ -510,10 +512,13 @@ func applyUCIConfig(cfg *Config, parsed *uciConfig) error {
 			return fmt.Errorf("verify_api.%s.auth_type: must be api_key or oauth", section.name)
 		}
 		cfg.Verify.APIs = append(cfg.Verify.APIs, opsapi.APIConfig{
-			Name:     section.name,
-			Label:    firstSectionValue(section, "label"),
-			Tailnet:  tailnet,
-			AuthType: authType,
+			Name:              section.name,
+			Label:             firstSectionValue(section, "label"),
+			Tailnet:           tailnet,
+			AuthType:          authType,
+			APIKey:            firstSectionValue(section, "api_key"),
+			OAuthClientID:     firstSectionValue(section, "oauth_client_id"),
+			OAuthClientSecret: firstSectionValue(section, "oauth_client_secret"),
 		})
 	}
 
@@ -639,54 +644,7 @@ func loadConfig() (*Config, error) {
 		return nil, err
 	}
 
-	secrets, err := loadAPISecrets(defaultAPISecretsConfigPath())
-	if err != nil {
-		return nil, err
-	}
-	for i := range cfg.Verify.APIs {
-		credentials := secrets[cfg.Verify.APIs[i].Name]
-		cfg.Verify.APIs[i].APIKey = credentials.APIKey
-		cfg.Verify.APIs[i].OAuthClientID = credentials.OAuthClientID
-		cfg.Verify.APIs[i].OAuthClientSecret = credentials.OAuthClientSecret
-	}
-
 	return cfg, nil
-}
-
-type apiCredentials struct {
-	APIKey            string
-	OAuthClientID     string
-	OAuthClientSecret string
-}
-
-func loadAPISecrets(path string) (map[string]apiCredentials, error) {
-	secrets := make(map[string]apiCredentials)
-	parsed, err := parseUCIConfig(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return secrets, nil
-		}
-		return nil, fmt.Errorf("load API secrets: %w", err)
-	}
-
-	if info, err := os.Stat(path); err != nil {
-		return nil, fmt.Errorf("stat API secrets: %w", err)
-	} else if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
-		return nil, fmt.Errorf("API secrets file must not be readable by group or others")
-	}
-
-	for _, section := range parsed.sectionsOfType("secret") {
-		name := strings.TrimSpace(section.name)
-		if name != "" {
-			secrets[name] = apiCredentials{
-				APIKey:            firstSectionValue(section, "api_key"),
-				OAuthClientID:     firstSectionValue(section, "oauth_client_id"),
-				OAuthClientSecret: firstSectionValue(section, "oauth_client_secret"),
-			}
-		}
-	}
-
-	return secrets, nil
 }
 
 func validateConfig(cfg *Config) error {

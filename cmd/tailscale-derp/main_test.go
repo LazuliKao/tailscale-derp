@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -752,10 +751,12 @@ func TestParseUCIConfig_RepeatedVerifyAPISections(t *testing.T) {
 
 config verify_api 'primary'
 	option label 'Primary'
+	option api_key 'tskey-api-primary'
 
 config verify_api 'secondary'
 	option label 'Secondary'
 	option tailnet 'T1234CNTRL'
+	option api_key 'tskey-api-secondary'
 `
 	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -780,34 +781,31 @@ config verify_api 'secondary'
 	if cfg.Verify.APIs[0].AuthType != opsapi.APIAuthTypeAPIKey || cfg.Verify.APIs[1].AuthType != opsapi.APIAuthTypeAPIKey {
 		t.Fatalf("expected API key authentication default: %+v", cfg.Verify.APIs)
 	}
-	if cfg.Verify.APIs[0].APIKey != "" || cfg.Verify.APIs[1].APIKey != "" || cfg.Verify.APIs[0].OAuthClientID != "" || cfg.Verify.APIs[1].OAuthClientSecret != "" {
-		t.Fatalf("credentials must not be read from the main config: %+v", cfg.Verify.APIs)
+	if cfg.Verify.APIs[0].APIKey != "tskey-api-primary" || cfg.Verify.APIs[1].APIKey != "tskey-api-secondary" {
+		t.Fatalf("expected API keys from main config: %+v", cfg.Verify.APIs)
 	}
 }
 
-func TestLoadAPISecrets(t *testing.T) {
+func TestParseUCIConfig_AnonymousVerifyAPISection(t *testing.T) {
 	tempDir := t.TempDir()
-	secretsPath := tempDir + "/tailscale-derp-secrets"
-	content := `config secret 'primary'
-	option api_key 'tskey-api-primary'
-
-config secret 'secondary'
-	option oauth_client_id 'client-id-secondary'
-	option oauth_client_secret 'client-secret-secondary'
+	configPath := tempDir + "/tailscale-derp"
+	content := `config verify_api
+	option label 'Anonymous'
+	option api_key 'tskey-api-anonymous'
 `
-	if err := os.WriteFile(secretsPath, []byte(content), 0o600); err != nil {
-		t.Fatalf("write secrets: %v", err)
-	}
-	if err := os.Chmod(secretsPath, 0o600); err != nil {
-		t.Fatalf("protect secrets: %v", err)
+	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
 	}
 
-	secrets, err := loadAPISecrets(secretsPath)
+	cfg, err := buildConfig([]string{"--config", configPath}, parseUCIConfig)
 	if err != nil {
-		t.Fatalf("load secrets: %v", err)
+		t.Fatalf("build config: %v", err)
 	}
-	if secrets["primary"].APIKey != "tskey-api-primary" || secrets["secondary"].OAuthClientID != "client-id-secondary" || secrets["secondary"].OAuthClientSecret != "client-secret-secondary" {
-		t.Fatalf("unexpected secrets: %#v", secrets)
+	if len(cfg.Verify.APIs) != 1 {
+		t.Fatalf("expected one API instance, got %d", len(cfg.Verify.APIs))
+	}
+	if cfg.Verify.APIs[0].Name != "verify_api_1" || cfg.Verify.APIs[0].APIKey != "tskey-api-anonymous" {
+		t.Fatalf("unexpected anonymous API instance: %+v", cfg.Verify.APIs[0])
 	}
 }
 
@@ -817,6 +815,8 @@ func TestParseUCIConfig_OAuthAPIInstance(t *testing.T) {
 	content := `config verify_api 'primary'
 	option auth_type 'oauth'
 	option tailnet 'T1234CNTRL'
+	option oauth_client_id 'client-id-primary'
+	option oauth_client_secret 'client-secret-primary'
 `
 	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -832,8 +832,8 @@ func TestParseUCIConfig_OAuthAPIInstance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build config: %v", err)
 	}
-	if len(cfg.Verify.APIs) != 1 || cfg.Verify.APIs[0].AuthType != opsapi.APIAuthTypeOAuth {
-		t.Fatalf("expected OAuth API instance, got %+v", cfg.Verify.APIs)
+	if len(cfg.Verify.APIs) != 1 || cfg.Verify.APIs[0].AuthType != opsapi.APIAuthTypeOAuth || cfg.Verify.APIs[0].OAuthClientID != "client-id-primary" || cfg.Verify.APIs[0].OAuthClientSecret != "client-secret-primary" {
+		t.Fatalf("expected OAuth API instance and credentials, got %+v", cfg.Verify.APIs)
 	}
 }
 
@@ -846,21 +846,5 @@ func TestParseUCIConfig_RejectsInvalidAPIAuthType(t *testing.T) {
 
 	if _, err := buildConfig([]string{"--config", configPath}, parseUCIConfig); err == nil {
 		t.Fatal("expected invalid API authentication type to be rejected")
-	}
-}
-
-func TestLoadAPISecretsRejectsBroadPermissions(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Windows does not preserve POSIX file permission bits")
-	}
-
-	tempDir := t.TempDir()
-	secretsPath := tempDir + "/tailscale-derp-secrets"
-	if err := os.WriteFile(secretsPath, []byte("config secret 'primary'\noption api_key 'secret'\n"), 0o644); err != nil {
-		t.Fatalf("write secrets: %v", err)
-	}
-
-	if _, err := loadAPISecrets(secretsPath); err == nil {
-		t.Fatal("expected broad permissions to be rejected")
 	}
 }

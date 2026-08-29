@@ -33,8 +33,8 @@ const (
 	APIAuthTypeOAuth  APIAuthType = "oauth"
 )
 
-// APIConfig identifies one Tailscale Official API tailnet. Credentials are
-// kept in memory only and are never included in status or device responses.
+// Credentials are loaded into memory at startup and are never included in
+// status or device responses.
 type APIConfig struct {
 	Name              string
 	Label             string
