@@ -209,8 +209,8 @@ func TestDeviceStoreUnionAndSources(t *testing.T) {
 			{Name: "two", Label: "Two", Tailnet: "T123"},
 		},
 		cache: map[string]deviceCache{
-			"one": {devices: map[string]Device{nodeKey: {NodeKey: nodeKey, Name: "device", Sources: []string{"One"}}}, lastSuccess: now},
-			"two": {devices: map[string]Device{nodeKey: {NodeKey: nodeKey, Name: "device", Sources: []string{"Two"}}}, lastSuccess: now},
+			"one": {devices: map[string]Device{nodeKey: {NodeID: "node-one", NodeKey: nodeKey, Name: "device", Sources: []string{"One"}, Origins: []DeviceOrigin{{Instance: "one", NodeID: "node-one"}}}}, lastSuccess: now},
+			"two": {devices: map[string]Device{nodeKey: {NodeID: "node-two", NodeKey: nodeKey, Name: "device", Sources: []string{"Two"}, Origins: []DeviceOrigin{{Instance: "two", NodeID: "node-two"}}}}, lastSuccess: now},
 		},
 		ttl: time.Minute,
 	}
@@ -220,5 +220,8 @@ func TestDeviceStoreUnionAndSources(t *testing.T) {
 	}
 	if len(response.Devices[0].Sources) != 2 {
 		t.Fatalf("expected two sources, got %v", response.Devices[0].Sources)
+	}
+	if len(response.Devices[0].Origins) != 2 {
+		t.Fatalf("expected two origins, got %v", response.Devices[0].Origins)
 	}
 }

@@ -73,23 +73,34 @@ type VerifyConfig struct {
 }
 
 type Device struct {
-	NodeID              string   `json:"nodeId,omitempty"`
-	NodeKey             string   `json:"nodeKey,omitempty"`
-	Name                string   `json:"name,omitempty"`
-	Hostname            string   `json:"hostname,omitempty"`
-	User                string   `json:"user,omitempty"`
-	Addresses           []string `json:"addresses,omitempty"`
-	OS                  string   `json:"os,omitempty"`
-	ClientVersion       string   `json:"clientVersion,omitempty"`
-	Authorized          bool     `json:"authorized"`
-	ConnectedToControl  bool     `json:"connectedToControl"`
-	LastSeen            string   `json:"lastSeen,omitempty"`
-	Expires             string   `json:"expires,omitempty"`
-	Tags                []string `json:"tags,omitempty"`
-	IsExternal          bool     `json:"isExternal"`
-	IsEphemeral         bool     `json:"isEphemeral"`
-	MultipleConnections bool     `json:"multipleConnections"`
-	Sources             []string `json:"sources,omitempty"`
+	NodeID              string         `json:"nodeId,omitempty"`
+	NodeKey             string         `json:"nodeKey,omitempty"`
+	Name                string         `json:"name,omitempty"`
+	Hostname            string         `json:"hostname,omitempty"`
+	User                string         `json:"user,omitempty"`
+	Addresses           []string       `json:"addresses,omitempty"`
+	OS                  string         `json:"os,omitempty"`
+	ClientVersion       string         `json:"clientVersion,omitempty"`
+	Authorized          bool           `json:"authorized"`
+	ConnectedToControl  bool           `json:"connectedToControl"`
+	LastSeen            string         `json:"lastSeen,omitempty"`
+	Expires             string         `json:"expires,omitempty"`
+	KeyExpiryDisabled   bool           `json:"keyExpiryDisabled"`
+	Tags                []string       `json:"tags,omitempty"`
+	IsExternal          bool           `json:"isExternal"`
+	IsEphemeral         bool           `json:"isEphemeral"`
+	MultipleConnections bool           `json:"multipleConnections"`
+	Sources             []string       `json:"sources,omitempty"`
+	Origins             []DeviceOrigin `json:"origins,omitempty"`
+}
+
+// DeviceOrigin identifies the API instance and Node ID that owns a merged
+// device entry. Mutations must use this pair instead of the display entry's
+// first NodeID.
+type DeviceOrigin struct {
+	Instance string `json:"instance"`
+	Label    string `json:"label,omitempty"`
+	NodeID   string `json:"nodeId"`
 }
 
 type DeviceSyncStatus struct {
@@ -269,10 +280,16 @@ func sanitizeDevice(raw tailscaleapi.Device, instance APIConfig) Device {
 		ConnectedToControl: raw.ConnectedToControl,
 		LastSeen:           formatAPITime(raw.LastSeen),
 		Expires:            formatAPITimeValue(raw.Expires),
+		KeyExpiryDisabled:  raw.KeyExpiryDisabled,
 		Tags:               append([]string(nil), raw.Tags...),
 		IsExternal:         raw.IsExternal,
 		IsEphemeral:        raw.IsEphemeral,
 		Sources:            []string{label},
+		Origins: []DeviceOrigin{{
+			Instance: instance.Name,
+			Label:    label,
+			NodeID:   raw.NodeID,
+		}},
 	}
 }
 
@@ -369,6 +386,7 @@ func (s *deviceStore) snapshot() DevicesResponse {
 		for nodeKey, device := range entry.devices {
 			if existing, ok := merged[nodeKey]; ok {
 				existing.Sources = appendUnique(existing.Sources, device.Sources...)
+				existing.Origins = appendUniqueOrigins(existing.Origins, device.Origins...)
 				merged[nodeKey] = existing
 			} else {
 				merged[nodeKey] = device
@@ -381,6 +399,24 @@ func (s *deviceStore) snapshot() DevicesResponse {
 		devices = append(devices, device)
 	}
 	return DevicesResponse{Devices: devices, Instances: instances}
+}
+
+func appendUniqueOrigins(values []DeviceOrigin, additions ...DeviceOrigin) []DeviceOrigin {
+	seen := make(map[string]struct{}, len(values)+len(additions))
+	for _, value := range values {
+		seen[value.Instance+"\x00"+value.NodeID] = struct{}{}
+	}
+	for _, value := range additions {
+		if value.Instance == "" || value.NodeID == "" {
+			continue
+		}
+		key := value.Instance + "\x00" + value.NodeID
+		if _, ok := seen[key]; !ok {
+			values = append(values, value)
+			seen[key] = struct{}{}
+		}
+	}
+	return values
 }
 
 func appendUnique(values []string, additions ...string) []string {
