@@ -202,9 +202,9 @@ func (s *deviceStore) setDeviceAttribute(ctx context.Context, instanceName, devi
 	if err != nil {
 		return errors.New("a valid RFC3339 expiry is required")
 	}
-	var value any
-	if err := json.Unmarshal(request.Value, &value); err != nil {
-		return errors.New("attribute value must be valid JSON")
+	value, err := decodeDeviceAttributeValue(request.Value)
+	if err != nil {
+		return err
 	}
 	ctx, cancel := context.WithTimeout(ctx, deviceRequestTimeout)
 	defer cancel()
@@ -321,10 +321,23 @@ func validateDeviceAttribute(request setDeviceAttributeRequest) error {
 	if _, err := time.Parse(time.RFC3339, request.Expiry); err != nil {
 		return errors.New("a valid RFC3339 expiry is required")
 	}
-	if !json.Valid(request.Value) {
-		return errors.New("attribute value must be valid JSON")
+	_, err := decodeDeviceAttributeValue(request.Value)
+	return err
+}
+
+func decodeDeviceAttributeValue(raw json.RawMessage) (any, error) {
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return nil, errors.New("attribute value must be valid JSON")
 	}
-	return nil
+	// rpcd transports arbitrary JSON values as a string because jshn only adds
+	// scalar fields. Decode that string while retaining direct API compatibility.
+	if encoded, ok := value.(string); ok && json.Valid([]byte(encoded)) {
+		if err := json.Unmarshal([]byte(encoded), &value); err != nil {
+			return nil, errors.New("attribute value must be valid JSON")
+		}
+	}
+	return value, nil
 }
 
 func handleSetDeviceAuthorized(store *deviceStore) http.HandlerFunc {

@@ -140,6 +140,16 @@ func TestDeviceMutationHandlersRejectInvalidRequests(t *testing.T) {
 	}
 }
 
+func TestDecodeDeviceAttributeValueAcceptsRPCJSONString(t *testing.T) {
+	value, err := decodeDeviceAttributeValue(json.RawMessage(`"{\"build\":\"123\"}"`))
+	if err != nil {
+		t.Fatalf("decode RPC value: %v", err)
+	}
+	if !reflect.DeepEqual(value, map[string]any{"build": "123"}) {
+		t.Fatalf("unexpected decoded value: %#v", value)
+	}
+}
+
 func newManagementTestStore(api *httptest.Server, secret, nodeKey string) *deviceStore {
 	store := newDeviceStore(VerifyConfig{APIs: []APIConfig{{Name: "primary", Tailnet: "-", APIKey: secret}}})
 	store.cache["primary"] = deviceCache{devices: map[string]Device{
