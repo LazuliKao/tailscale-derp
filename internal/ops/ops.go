@@ -24,7 +24,7 @@ type Config struct {
 	Listen          string
 	STUN            bool
 	Mesh            bool
-	OpsAddr         string
+	OpsSocket       string
 	Health          string
 	TrafficPersist  bool
 	TrafficPath     string
@@ -43,7 +43,7 @@ type Status struct {
 	Listen             string   `json:"listen"`
 	STUN               bool     `json:"stun"`
 	Mesh               bool     `json:"mesh"`
-	Metrics            string   `json:"metrics"`
+	OpsSocket          string   `json:"opsSocket"`
 	Health             string   `json:"health"`
 	TrafficPersist     bool     `json:"trafficPersist"`
 	TrafficPath        string   `json:"trafficPath,omitempty"`
@@ -78,9 +78,9 @@ func StatusFromConfig(cfg Config, snapshot Snapshot, mf MetricsFunc, tf TrafficF
 	if snapshot != nil {
 		running, errMsg = snapshot()
 	}
-	metricsAddr := cfg.OpsAddr
-	if metricsAddr == "" {
-		metricsAddr = "127.0.0.1:9911"
+	opsSocket := cfg.OpsSocket
+	if opsSocket == "" {
+		opsSocket = DefaultOpsSocketPath
 	}
 	healthAddr := cfg.Health
 	if healthAddr == "" {
@@ -99,7 +99,7 @@ func StatusFromConfig(cfg Config, snapshot Snapshot, mf MetricsFunc, tf TrafficF
 		Listen:             cfg.Listen,
 		STUN:               cfg.STUN,
 		Mesh:               cfg.Mesh,
-		Metrics:            metricsAddr,
+		OpsSocket:          opsSocket,
 		Health:             healthAddr,
 		TrafficPersist:     cfg.TrafficPersist,
 		TrafficPath:        cfg.TrafficPath,

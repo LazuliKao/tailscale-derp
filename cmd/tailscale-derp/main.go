@@ -35,7 +35,7 @@ var getServerMetrics opsapi.MetricsFunc
 const (
 	defaultNodeKeyPath     = "/var/lib/tailscale-derp/node.key"
 	defaultListenAddr      = ":3478"
-	defaultOpsAddr         = "127.0.0.1:9911"
+	defaultOpsSocket       = opsapi.DefaultOpsSocketPath
 	defaultHealthAddr      = ":9912"
 	defaultTrafficPath     = "/tmp/tailscale-derp-traffic.json"
 	defaultTrafficInterval = 60
@@ -59,7 +59,7 @@ type Config struct {
 	KeyFile              string
 	Mesh                 bool
 	MeshKey              string
-	OpsAddr              string
+	OpsSocket            string
 	Health               string
 	TrafficPersist       bool
 	TrafficPath          string
@@ -112,7 +112,7 @@ type configFlags struct {
 	KeyFile              *string
 	Mesh                 *bool
 	MeshKey              *string
-	OpsAddr              *string
+	OpsSocket            *string
 	HealthAddr           *string
 	TrafficPersist       *bool
 	TrafficPath          *string
@@ -138,27 +138,6 @@ var execServiceAction actionExecutor = runServiceAction
 
 const serviceScriptPath = service.DefaultScriptPath
 
-func isLoopbackOpsAddress(value string) bool {
-	trimmed := strings.TrimSpace(value)
-
-	if trimmed == "" {
-		return false
-	}
-
-	if strings.HasPrefix(trimmed, ":") {
-		return false
-	}
-
-	for _, prefix := range []string{"127.0.0.1:", "localhost:", "[::1]:"} {
-		if port, ok := strings.CutPrefix(trimmed, prefix); ok {
-			_, err := strconv.Atoi(port)
-			return err == nil
-		}
-	}
-
-	return false
-}
-
 func newFlagSet(args []string) (*flag.FlagSet, *configFlags, error) {
 	fs := flag.NewFlagSet("tailscale-derp", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -172,7 +151,7 @@ func newFlagSet(args []string) (*flag.FlagSet, *configFlags, error) {
 		KeyFile:              fs.String("keyfile", "", "TLS key file"),
 		Mesh:                 fs.Bool("mesh", false, "enable mesh mode"),
 		MeshKey:              fs.String("mesh-key", "", "shared mesh key"),
-		OpsAddr:              fs.String("ops", "", "ops server address"),
+		OpsSocket:            fs.String("ops-socket", "", "ops server Unix socket path"),
 		HealthAddr:           fs.String("health", "", "health server address"),
 		TrafficPersist:       fs.Bool("traffic-persist", false, "enable traffic statistics persistence"),
 		TrafficPath:          fs.String("traffic-path", "", "path to traffic statistics file"),
@@ -322,7 +301,7 @@ func buildConfig(args []string, openFile func(string) (*uciConfig, error)) (*Con
 		Enabled:         false,
 		Listen:          defaultListenAddr,
 		STUN:            true,
-		OpsAddr:         defaultOpsAddr,
+		OpsSocket:       defaultOpsSocket,
 		Health:          defaultHealthAddr,
 		TrafficPath:     defaultTrafficPath,
 		TrafficInterval: defaultTrafficInterval,
@@ -400,8 +379,8 @@ func applyUCIConfig(cfg *Config, parsed *uciConfig) error {
 		cfg.MeshKey = strings.TrimSpace(value)
 	}
 
-	if value, ok := parsed.first("ops", "metrics"); ok && value != "" {
-		cfg.OpsAddr = value
+	if value, ok := parsed.first("ops", "socket"); ok && strings.TrimSpace(value) != "" {
+		cfg.OpsSocket = strings.TrimSpace(value)
 	}
 
 	if value, ok := parsed.first("ops", "health"); ok && value != "" {
@@ -605,8 +584,8 @@ func applyFlagOverrides(cfg *Config, fs *flag.FlagSet, flags *configFlags) {
 	if stringFlagProvided(fs, "mesh-key") {
 		cfg.MeshKey = strings.TrimSpace(*flags.MeshKey)
 	}
-	if stringFlagProvided(fs, "ops") {
-		cfg.OpsAddr = strings.TrimSpace(*flags.OpsAddr)
+	if stringFlagProvided(fs, "ops-socket") {
+		cfg.OpsSocket = strings.TrimSpace(*flags.OpsSocket)
 	}
 	if stringFlagProvided(fs, "health") {
 		cfg.Health = strings.TrimSpace(*flags.HealthAddr)
@@ -663,12 +642,6 @@ func validateConfig(cfg *Config) error {
 	if err := validateOptionalPortBinding("listen", cfg.Listen); err != nil {
 		return err
 	}
-	if err := validateOptionalPortBinding("ops", cfg.OpsAddr); err != nil {
-		return err
-	}
-	if !isLoopbackOpsAddress(cfg.OpsAddr) {
-		return fmt.Errorf("ops must bind to loopback only")
-	}
 	if err := validateOptionalPortBinding("health", cfg.Health); err != nil {
 		return err
 	}
@@ -693,17 +666,17 @@ func startDERP(cfg *Config, state *runtimeState, persister *traffic.Persister) e
 			return fmt.Errorf("parse mesh key: %w", err)
 		}
 	}
-	opsAddr := cfg.OpsAddr
-	if opsAddr == "" {
-		opsAddr = defaultOpsAddr
-	}
-	if strings.HasPrefix(opsAddr, ":") {
-		opsAddr = "127.0.0.1" + opsAddr
+	opsSocket := cfg.OpsSocket
+	if opsSocket == "" {
+		opsSocket = defaultOpsSocket
 	}
 	server.SetVerifyClient(false)
 	server.SetVerifyClientURLFailOpen(false)
 	if cfg.Verify.Enabled {
-		admissionURL := fmt.Sprintf("http://%s/verify", opsAddr)
+		admissionURL := "http://unix/verify"
+		// derpserver performs this request through http.DefaultClient. Route it
+		// to the Ops Unix socket using a valid synthetic host.
+		http.DefaultTransport = opsapi.NewUnixHTTPTransport(opsSocket)
 		server.SetVerifyClientURL(admissionURL)
 		log.Printf("Client verification enabled at %s (urls: %v, tailscaled: %v, official API: %v)", admissionURL, cfg.Verify.URLsEnabled, cfg.Verify.TailscaledEnabled, cfg.Verify.APIEnabled)
 	} else {
@@ -906,7 +879,7 @@ func opsConfig(cfg *Config) opsapi.Config {
 		Listen:          cfg.Listen,
 		STUN:            cfg.STUN,
 		Mesh:            cfg.Mesh,
-		OpsAddr:         cfg.OpsAddr,
+		OpsSocket:       cfg.OpsSocket,
 		Health:          cfg.Health,
 		TrafficPersist:  cfg.TrafficPersist,
 		TrafficPath:     cfg.TrafficPath,
@@ -926,21 +899,37 @@ func handleStatusWithTraffic(cfg *Config, state *runtimeState, persister *traffi
 }
 
 func startOps(cfg *Config, state *runtimeState, persister *traffic.Persister) error {
-	log.Printf("Starting ops server on %s", cfg.OpsAddr)
+	listenAddr := cfg.OpsSocket
+	if listenAddr == "" {
+		listenAddr = defaultOpsSocket
+	}
+	log.Printf("Starting ops server on %s", listenAddr)
 	var snapshot opsapi.Snapshot
 	if state != nil {
 		snapshot = state.snapshot
 	}
 	t := tracker.NewPeerTracker()
 	server := &http.Server{
-		Addr:              cfg.OpsAddr,
+		Addr:              listenAddr,
 		Handler:           opsapi.NewMux(opsConfig(cfg), snapshot, execServiceAction, getServerMetrics, t, trafficTotalsFunc(persister)),
 		ReadHeaderTimeout: opsReadHeaderTimeout,
 		ReadTimeout:       opsReadTimeout,
 		WriteTimeout:      opsWriteTimeout,
 		IdleTimeout:       opsIdleTimeout,
 	}
-	return server.ListenAndServe()
+	listener, err := opsapi.ListenUnix(listenAddr)
+	if err != nil {
+		if state != nil {
+			state.setError(err)
+		}
+		return err
+	}
+	defer func() {
+		if err := listener.Close(); err != nil {
+			log.Printf("Ops Unix socket cleanup failed: %v", err)
+		}
+	}()
+	return server.Serve(listener)
 }
 
 func main() {

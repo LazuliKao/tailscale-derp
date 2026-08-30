@@ -33,8 +33,8 @@ func TestBuildConfig_DefaultsWithoutUCI(t *testing.T) {
 	if !cfg.STUN {
 		t.Fatal("expected STUN enabled by default")
 	}
-	if cfg.OpsAddr != "127.0.0.1:9911" {
-		t.Fatalf("expected default ops addr 127.0.0.1:9911, got %q", cfg.OpsAddr)
+	if cfg.OpsSocket != defaultOpsSocket {
+		t.Fatalf("expected default ops socket %q, got %q", defaultOpsSocket, cfg.OpsSocket)
 	}
 	if cfg.Health != ":9912" {
 		t.Fatalf("expected default health addr :9912, got %q", cfg.Health)
@@ -57,8 +57,8 @@ func TestBuildConfig_AppliesUCIConfig(t *testing.T) {
 			"key":     {"shared-mesh-key"},
 		},
 		"ops": {
-			"metrics": {":9001"},
-			"health":  {":9002"},
+			"socket": {"/tmp/custom-ops.sock"},
+			"health": {":9002"},
 		},
 	}}
 
@@ -81,10 +81,11 @@ func TestBuildConfig_AppliesUCIConfig(t *testing.T) {
 	if cfg.MeshKey != "shared-mesh-key" {
 		t.Fatalf("unexpected mesh key: %q", cfg.MeshKey)
 	}
-	if cfg.OpsAddr != ":9001" || cfg.Health != ":9002" {
+	if cfg.OpsSocket != "/tmp/custom-ops.sock" || cfg.Health != ":9002" {
 		t.Fatalf("unexpected ops config: %+v", cfg)
 	}
 }
+
 
 func TestBuildConfig_AppliesCustomTailscaledSocketSettings(t *testing.T) {
 	parsed := &uciConfig{values: map[string]map[string][]string{
@@ -119,8 +120,8 @@ func TestBuildConfig_FlagOverridesUCI(t *testing.T) {
 			"enabled": {"0"},
 		},
 		"ops": {
-			"metrics": {":9001"},
-			"health":  {":9002"},
+			"socket": {"/tmp/uci-ops.sock"},
+			"health": {":9002"},
 		},
 	}}
 
@@ -131,7 +132,7 @@ func TestBuildConfig_FlagOverridesUCI(t *testing.T) {
 		"--stun",
 		"--mesh",
 		"--mesh-key", "override-mesh-key",
-		"--ops", ":9100",
+		"--ops-socket", "/tmp/cli-ops.sock",
 		"--health", ":9101",
 	}
 
@@ -148,7 +149,7 @@ func TestBuildConfig_FlagOverridesUCI(t *testing.T) {
 	if cfg.MeshKey != "override-mesh-key" {
 		t.Fatalf("unexpected overridden mesh key: %q", cfg.MeshKey)
 	}
-	if cfg.OpsAddr != ":9100" || cfg.Health != ":9101" {
+	if cfg.OpsSocket != "/tmp/cli-ops.sock" || cfg.Health != ":9101" {
 		t.Fatalf("unexpected overridden ops values: %+v", cfg)
 	}
 }
@@ -221,7 +222,7 @@ func TestStatusFromConfig_RecoversAfterError(t *testing.T) {
 		Listen:  ":3478",
 		STUN:    true,
 		Mesh:    true,
-		OpsAddr: "127.0.0.1:9911",
+		OpsSocket: defaultOpsSocket,
 		Health:  ":9912",
 	}, state)
 
@@ -238,7 +239,6 @@ func TestValidateConfig_Valid(t *testing.T) {
 		Enabled: true,
 		Listen:  ":3478",
 		STUN:    true,
-		OpsAddr: "127.0.0.1:9911",
 		Health:  ":9912",
 	}
 	if err := validateConfig(cfg); err != nil {
@@ -263,7 +263,7 @@ func TestValidateConfig_MeshWithoutKey(t *testing.T) {
 	cfg := &Config{
 		Listen:  ":3478",
 		Mesh:    true,
-		OpsAddr: "127.0.0.1:9911",
+		OpsSocket: defaultOpsSocket,
 	}
 	err := validateConfig(cfg)
 	if err == nil {
@@ -279,7 +279,7 @@ func TestValidateConfig_MeshWithKey(t *testing.T) {
 		Listen:  ":3478",
 		Mesh:    true,
 		MeshKey: "shared-mesh-key",
-		OpsAddr: "127.0.0.1:9911",
+		OpsSocket: defaultOpsSocket,
 	}
 	if err := validateConfig(cfg); err != nil {
 		t.Fatalf("expected no error, got: %v", err)
@@ -321,54 +321,10 @@ func TestValidateConfig_BothTLSFiles(t *testing.T) {
 		Listen:   ":3478",
 		CertFile: "/path/to/cert.pem",
 		KeyFile:  "/path/to/key.pem",
-		OpsAddr:  "127.0.0.1:9911",
+		OpsSocket: defaultOpsSocket,
 	}
 	if err := validateConfig(cfg); err != nil {
 		t.Fatalf("expected no error, got: %v", err)
-	}
-}
-
-func TestValidateConfig_LoopbackOpsAddressAllowed(t *testing.T) {
-	cfg := &Config{
-		Listen:  ":3478",
-		OpsAddr: "127.0.0.1:9911",
-		Health:  ":9912",
-	}
-
-	if err := validateConfig(cfg); err != nil {
-		t.Fatalf("expected loopback ops address to be allowed, got: %v", err)
-	}
-}
-
-func TestValidateConfig_BareOpsPortRejected(t *testing.T) {
-	cfg := &Config{
-		Listen:  ":3478",
-		OpsAddr: ":9911",
-		Health:  ":9912",
-	}
-
-	err := validateConfig(cfg)
-	if err == nil {
-		t.Fatal("expected bare ops port to be rejected")
-	}
-	if !strings.Contains(err.Error(), "ops must bind to loopback only") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestValidateConfig_NonLoopbackOpsAddressRejected(t *testing.T) {
-	cfg := &Config{
-		Listen:  ":3478",
-		OpsAddr: "10.0.0.5:9911",
-		Health:  ":9912",
-	}
-
-	err := validateConfig(cfg)
-	if err == nil {
-		t.Fatal("expected non-loopback ops address to be rejected")
-	}
-	if !strings.Contains(err.Error(), "ops must bind to loopback only") {
-		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
@@ -618,8 +574,8 @@ func TestStatusEndpoint(t *testing.T) {
 	if result["stun"] != true {
 		t.Fatalf("expected stun true, got %v", result["stun"])
 	}
-	if result["metrics"] != "127.0.0.1:9911" {
-		t.Fatalf("expected metrics 127.0.0.1:9911, got %v", result["metrics"])
+	if result["opsSocket"] != defaultOpsSocket {
+		t.Fatalf("expected ops socket %q, got %v", defaultOpsSocket, result["opsSocket"])
 	}
 	if result["health"] != ":9912" {
 		t.Fatalf("expected health :9912, got %v", result["health"])
@@ -631,7 +587,6 @@ func TestStatusEndpoint_ServiceUnavailable(t *testing.T) {
 		Listen:  ":3478",
 		STUN:    false,
 		Mesh:    false,
-		OpsAddr: "127.0.0.1:9911",
 		Health:  ":9912",
 	}
 	state := &runtimeState{}
@@ -727,8 +682,8 @@ func TestConfig_DefaultValues(t *testing.T) {
 		Enabled: true,
 		Listen:  ":3478",
 		STUN:    true,
-		OpsAddr: "127.0.0.1:9911",
-		Health:  ":9912",
+		OpsSocket: defaultOpsSocket,
+		Health:     ":9912",
 	}
 	if !cfg.Enabled {
 		t.Fatal("expected Enabled to be true")
