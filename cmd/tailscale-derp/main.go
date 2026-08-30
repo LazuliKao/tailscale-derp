@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -19,8 +20,10 @@ import (
 	"time"
 
 	"github.com/LazuliKao/tailscale-derp/internal/derpserver"
+	"github.com/LazuliKao/tailscale-derp/internal/endpoint"
 	"github.com/LazuliKao/tailscale-derp/internal/httpjson"
 	opsapi "github.com/LazuliKao/tailscale-derp/internal/ops"
+	"github.com/LazuliKao/tailscale-derp/internal/portmap"
 	"github.com/LazuliKao/tailscale-derp/internal/service"
 	"github.com/LazuliKao/tailscale-derp/internal/tracker"
 	"github.com/LazuliKao/tailscale-derp/internal/traffic"
@@ -49,6 +52,7 @@ const (
 
 type Config struct {
 	Verify          opsapi.VerifyConfig
+	External        endpoint.Config
 	Enabled         bool
 	Listen          string
 	STUN            bool
@@ -304,6 +308,15 @@ func buildConfig(args []string, openFile func(string) (*uciConfig, error)) (*Con
 			SyncInterval: 5 * time.Minute,
 			CacheTTL:     15 * time.Minute,
 		},
+		External: endpoint.Config{
+			Methods:       []string{"pcp", "natpmp", "upnp"},
+			WANInterface:  "auto",
+			DERPPort:      "auto",
+			STUNPort:      "auto",
+			LeaseDuration: 2 * time.Hour,
+			RetryInterval: time.Minute,
+			SyncInterval:  5 * time.Minute,
+		},
 	}
 
 	if flags.ConfigPath != nil && *flags.ConfigPath != "" {
@@ -320,6 +333,8 @@ func buildConfig(args []string, openFile func(string) (*uciConfig, error)) (*Con
 	}
 
 	applyFlagOverrides(cfg, fs, flags)
+	cfg.External.STUNEnabled = cfg.STUN
+	cfg.External.TLSConfigured = cfg.CertFile != "" && cfg.KeyFile != ""
 	if strings.TrimSpace(cfg.TrafficPath) == "" {
 		cfg.TrafficPath = defaultTrafficPath
 	}
@@ -400,6 +415,61 @@ func applyUCIConfig(cfg *Config, parsed *uciConfig) error {
 			return fmt.Errorf("traffic.interval: %w", err)
 		}
 		cfg.TrafficInterval = parsedInt
+	}
+
+	if value, ok := parsed.first("external", "enabled"); ok {
+		parsedBool, err := parseBoolValue(value)
+		if err != nil {
+			return fmt.Errorf("external.enabled: %w", err)
+		}
+		cfg.External.Enabled = parsedBool
+	}
+	if methods := parsed.get("external", "method"); len(methods) > 0 {
+		cfg.External.Methods = nil
+		for _, method := range methods {
+			for _, part := range strings.Split(method, ",") {
+				if part = strings.ToLower(strings.TrimSpace(part)); part != "" {
+					cfg.External.Methods = append(cfg.External.Methods, part)
+				}
+			}
+		}
+	}
+	if value, ok := parsed.first("external", "wan_interface"); ok && strings.TrimSpace(value) != "" {
+		cfg.External.WANInterface = strings.TrimSpace(value)
+	}
+	if value, ok := parsed.first("external", "derp_port"); ok && strings.TrimSpace(value) != "" {
+		cfg.External.DERPPort = strings.TrimSpace(value)
+	}
+	if value, ok := parsed.first("external", "stun_port"); ok && strings.TrimSpace(value) != "" {
+		cfg.External.STUNPort = strings.TrimSpace(value)
+	}
+	if value, ok := parsed.first("external", "lease_seconds"); ok {
+		seconds, err := strconv.Atoi(value)
+		if err != nil || seconds <= 0 {
+			return fmt.Errorf("external.lease_seconds: must be a positive number")
+		}
+		cfg.External.LeaseDuration = time.Duration(seconds) * time.Second
+	}
+	if value, ok := parsed.first("external", "retry_seconds"); ok {
+		seconds, err := strconv.Atoi(value)
+		if err != nil || seconds <= 0 {
+			return fmt.Errorf("external.retry_seconds: must be a positive number")
+		}
+		cfg.External.RetryInterval = time.Duration(seconds) * time.Second
+	}
+	if value, ok := parsed.first("external", "sync_interval"); ok {
+		seconds, err := strconv.Atoi(value)
+		if err != nil || seconds <= 0 {
+			return fmt.Errorf("external.sync_interval: must be a positive number")
+		}
+		cfg.External.SyncInterval = time.Duration(seconds) * time.Second
+	}
+	if value, ok := parsed.first("external", "validate_endpoint"); ok {
+		parsedBool, err := parseBoolValue(value)
+		if err != nil {
+			return fmt.Errorf("external.validate_endpoint: %w", err)
+		}
+		cfg.External.ValidateEndpoint = parsedBool
 	}
 
 	var verifyURLs []string
@@ -484,7 +554,23 @@ func applyUCIConfig(cfg *Config, parsed *uciConfig) error {
 		if authType != opsapi.APIAuthTypeAPIKey && authType != opsapi.APIAuthTypeOAuth {
 			return fmt.Errorf("verify_api.%s.auth_type: must be api_key or oauth", section.name)
 		}
-		cfg.Verify.APIs = append(cfg.Verify.APIs, opsapi.APIConfig{
+		derpMapSync := false
+		if value := firstSectionValue(section, "derpmap_sync"); value != "" {
+			parsedBool, err := parseBoolValue(value)
+			if err != nil {
+				return fmt.Errorf("verify_api.%s.derpmap_sync: %w", section.name, err)
+			}
+			derpMapSync = parsedBool
+		}
+		regionID := 0
+		if value := firstSectionValue(section, "region_id"); value != "" {
+			parsedRegionID, err := strconv.Atoi(value)
+			if err != nil {
+				return fmt.Errorf("verify_api.%s.region_id: must be an integer", section.name)
+			}
+			regionID = parsedRegionID
+		}
+		apiConfig := opsapi.APIConfig{
 			Name:              section.name,
 			Label:             firstSectionValue(section, "label"),
 			Tailnet:           tailnet,
@@ -492,8 +578,25 @@ func applyUCIConfig(cfg *Config, parsed *uciConfig) error {
 			APIKey:            firstSectionValue(section, "api_key"),
 			OAuthClientID:     firstSectionValue(section, "oauth_client_id"),
 			OAuthClientSecret: firstSectionValue(section, "oauth_client_secret"),
-		})
+			DERPMapSync:       derpMapSync,
+			RegionID:          regionID,
+			RegionCode:        firstSectionValue(section, "region_code"),
+			RegionName:        firstSectionValue(section, "region_name"),
+			NodeName:          firstSectionValue(section, "node_name"),
+			Hostname:          firstSectionValue(section, "hostname"),
+			CertName:          firstSectionValue(section, "cert_name"),
+		}
+		cfg.Verify.APIs = append(cfg.Verify.APIs, apiConfig)
+		if apiConfig.DERPMapSync {
+			validationName := apiConfig.CertName
+			if validationName == "" {
+				validationName = apiConfig.Hostname
+			}
+			cfg.External.ValidationNames = append(cfg.External.ValidationNames, validationName)
+		}
 	}
+	cfg.External.STUNEnabled = cfg.STUN
+	cfg.External.TLSConfigured = cfg.CertFile != "" && cfg.KeyFile != ""
 
 	// Existing URL-only configurations remain active without requiring a
 	// manual migration. New configurations have no URL and stay disabled.
@@ -633,10 +736,56 @@ func validateConfig(cfg *Config) error {
 	if err := validateOptionalPortBinding("health", cfg.Health); err != nil {
 		return err
 	}
+	if err := validateExternalPort("external.derp_port", cfg.External.DERPPort); err != nil {
+		return err
+	}
+	if err := validateExternalPort("external.stun_port", cfg.External.STUNPort); err != nil {
+		return err
+	}
+	allowedMethods := map[string]bool{"pcp": true, "natpmp": true, "upnp": true}
+	if cfg.External.Enabled && len(cfg.External.Methods) == 0 {
+		return fmt.Errorf("external requires at least one mapping method")
+	}
+	for _, method := range cfg.External.Methods {
+		if !allowedMethods[method] {
+			return fmt.Errorf("external.method: unsupported method %q", method)
+		}
+	}
+	for _, api := range cfg.Verify.APIs {
+		if !api.DERPMapSync {
+			continue
+		}
+		if !cfg.External.Enabled {
+			return fmt.Errorf("verify_api.%s.derpmap_sync requires external.enabled", api.Name)
+		}
+		if !api.Configured() {
+			return fmt.Errorf("verify_api.%s.derpmap_sync requires tailnet and API credentials", api.Name)
+		}
+		if api.RegionID < 900 || api.RegionID > 999 {
+			return fmt.Errorf("verify_api.%s.region_id must be between 900 and 999", api.Name)
+		}
+		if strings.TrimSpace(api.RegionCode) == "" || strings.TrimSpace(api.RegionName) == "" || strings.TrimSpace(api.NodeName) == "" || strings.TrimSpace(api.Hostname) == "" {
+			return fmt.Errorf("verify_api.%s DERP map metadata is incomplete", api.Name)
+		}
+	}
+	if cfg.External.Enabled && !cfg.External.TLSConfigured {
+		return fmt.Errorf("external endpoint publishing requires TLS certfile and keyfile")
+	}
 	return nil
 }
 
-func startDERP(cfg *Config, state *runtimeState, persister *traffic.Persister) error {
+func validateExternalPort(name, value string) error {
+	if value == "" || strings.EqualFold(value, "auto") {
+		return nil
+	}
+	port, err := strconv.ParseUint(value, 10, 16)
+	if err != nil || port == 0 {
+		return fmt.Errorf("%s must be auto or an integer from 1 to 65535", name)
+	}
+	return nil
+}
+
+func startDERP(ctx context.Context, cfg *Config, state *runtimeState, persister *traffic.Persister, runtime *opsapi.Runtime, external *endpoint.Manager) error {
 	privateKey, err := loadOrCreateNodeKey(defaultNodeKeyPath)
 	if err != nil {
 		if state != nil {
@@ -655,7 +804,11 @@ func startDERP(cfg *Config, state *runtimeState, persister *traffic.Persister) e
 		}
 	}
 	if cfg.Verify.Enabled {
-		server.SetVerifyClientFunc(opsapi.NewVerifyClientFunc(cfg.Verify, admissionTracker))
+		if runtime != nil {
+			server.SetVerifyClientFunc(runtime.VerifyClientFunc())
+		} else {
+			server.SetVerifyClientFunc(opsapi.NewVerifyClientFunc(cfg.Verify, admissionTracker))
+		}
 		log.Printf("Client verification enabled (urls: %v, tailscaled: %v, official API: %v)", cfg.Verify.URLsEnabled, cfg.Verify.TailscaledEnabled, cfg.Verify.APIEnabled)
 	} else {
 		log.Printf("Client verification disabled")
@@ -680,13 +833,33 @@ func startDERP(cfg *Config, state *runtimeState, persister *traffic.Persister) e
 		}()
 		persister.Start(trafficCtx)
 	}
+	listener, err := net.Listen("tcp", cfg.Listen)
+	if err != nil {
+		return fmt.Errorf("listen for DERP: %w", err)
+	}
+	defer listener.Close()
+	derpPort, err := addressPort(listener.Addr())
+	if err != nil {
+		return err
+	}
+	var stunPort uint16
 	if cfg.STUN {
-		stun := stunserver.New(context.Background())
+		stun := stunserver.New(ctx)
+		if err := stun.Listen(cfg.Listen); err != nil {
+			return fmt.Errorf("listen for STUN: %w", err)
+		}
+		stunPort, err = addressPort(stun.LocalAddr())
+		if err != nil {
+			return err
+		}
 		go func() {
-			if err := stun.ListenAndServe(cfg.Listen); err != nil {
+			if err := stun.Serve(); err != nil {
 				log.Printf("STUN server stopped: %v", err)
 			}
 		}()
+	}
+	if external != nil {
+		external.SetLocalPorts(derpPort, stunPort)
 	}
 
 	mux := http.NewServeMux()
@@ -716,7 +889,7 @@ func startDERP(cfg *Config, state *runtimeState, persister *traffic.Persister) e
 				return &certificate, nil
 			},
 		}
-		err := httpServer.ListenAndServeTLS("", "")
+		err := httpServer.ServeTLS(listener, "", "")
 		if state != nil && err != nil {
 			state.setError(err)
 		}
@@ -724,11 +897,23 @@ func startDERP(cfg *Config, state *runtimeState, persister *traffic.Persister) e
 	}
 
 	log.Printf("TLS cert/key not configured; serving DERP over plain HTTP for baseline testing only")
-	err = httpServer.ListenAndServe()
+	err = httpServer.Serve(listener)
 	if state != nil && err != nil {
 		state.setError(err)
 	}
 	return err
+}
+
+func addressPort(address net.Addr) (uint16, error) {
+	_, rawPort, err := net.SplitHostPort(address.String())
+	if err != nil {
+		return 0, fmt.Errorf("parse listener address %q: %w", address, err)
+	}
+	port, err := strconv.ParseUint(rawPort, 10, 16)
+	if err != nil || port == 0 {
+		return 0, fmt.Errorf("listener returned invalid port %q", rawPort)
+	}
+	return uint16(port), nil
 }
 
 func publishDERPMetrics(server *derpserver.Server) expvar.Var {
@@ -857,6 +1042,7 @@ func opsConfig(cfg *Config) opsapi.Config {
 		TrafficPersist:  cfg.TrafficPersist,
 		TrafficPath:     cfg.TrafficPath,
 		TrafficInterval: cfg.TrafficInterval,
+		ExternalEnabled: cfg.External.Enabled,
 	}
 }
 func handleStatus(cfg *Config, state *runtimeState) http.HandlerFunc {
@@ -871,7 +1057,7 @@ func handleStatusWithTraffic(cfg *Config, state *runtimeState, persister *traffi
 	return opsapi.HandleStatus(opsConfig(cfg), snapshot, nil, trafficTotalsFunc(persister))
 }
 
-func startOps(cfg *Config, state *runtimeState, persister *traffic.Persister) error {
+func startOps(cfg *Config, state *runtimeState, persister *traffic.Persister, runtime *opsapi.Runtime, external *endpoint.Manager) error {
 	listenAddr := cfg.OpsSocket
 	if listenAddr == "" {
 		listenAddr = defaultOpsSocket
@@ -883,7 +1069,7 @@ func startOps(cfg *Config, state *runtimeState, persister *traffic.Persister) er
 	}
 	server := &http.Server{
 		Addr:              listenAddr,
-		Handler:           opsapi.NewMux(opsConfig(cfg), snapshot, execServiceAction, getServerMetrics, admissionTracker, trafficTotalsFunc(persister)),
+		Handler:           opsapi.NewMuxWithRuntime(opsConfig(cfg), snapshot, execServiceAction, getServerMetrics, admissionTracker, trafficTotalsFunc(persister), runtime, external),
 		ReadHeaderTimeout: opsReadHeaderTimeout,
 		ReadTimeout:       opsReadTimeout,
 		WriteTimeout:      opsWriteTimeout,
@@ -919,6 +1105,8 @@ func main() {
 
 	state := &runtimeState{}
 	var persister *traffic.Persister
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	if !cfg.Enabled {
 		log.Println("Service disabled")
@@ -928,14 +1116,22 @@ func main() {
 	if cfg.TrafficPersist {
 		persister = traffic.New(true, cfg.TrafficPath, time.Duration(cfg.TrafficInterval)*time.Second, trafficSessionMetrics)
 	}
+	if cfg.External.Enabled {
+		if _, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile); err != nil {
+			log.Fatalf("Invalid TLS certificate for external endpoint publishing: %v", err)
+		}
+	}
+	runtime := opsapi.NewRuntime(ctx, cfg.Verify, admissionTracker)
+	external := endpoint.NewManager(cfg.External, portmap.NewClient(cfg.External.Methods), endpoint.LocalValidator{}, runtime)
+	external.Start(ctx)
 
 	go func() {
-		if err := startOps(cfg, state, persister); err != nil {
+		if err := startOps(cfg, state, persister, runtime, external); err != nil {
 			log.Fatalf("Ops server failed: %v", err)
 		}
 	}()
 
-	if err := startDERP(cfg, state, persister); err != nil {
+	if err := startDERP(ctx, cfg, state, persister, runtime, external); err != nil {
 		log.Fatalf("DERP server failed: %v", err)
 	}
 }

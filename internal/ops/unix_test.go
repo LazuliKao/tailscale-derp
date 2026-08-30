@@ -69,7 +69,6 @@ func TestListenUnixRejectsLiveSocketAndReplacesStaleSocket(t *testing.T) {
 	defer replacement.Close()
 }
 
-
 func TestListenUnixDoesNotRemoveRegularFile(t *testing.T) {
 	path := testSocketPath(t, false)
 	if err := os.WriteFile(path, []byte("not a socket"), 0o600); err != nil {

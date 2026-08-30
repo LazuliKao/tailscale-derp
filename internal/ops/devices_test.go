@@ -13,7 +13,6 @@ import (
 	"tailscale.com/types/key"
 )
 
-
 func TestVerifierCombinesMechanismsWithOR(t *testing.T) {
 	nodeKey := key.NewNode().Public()
 	verifier := &verifier{

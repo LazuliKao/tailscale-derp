@@ -41,6 +41,13 @@ type APIConfig struct {
 	APIKey            string
 	OAuthClientID     string
 	OAuthClientSecret string
+	DERPMapSync       bool
+	RegionID          int
+	RegionCode        string
+	RegionName        string
+	NodeName          string
+	Hostname          string
+	CertName          string
 }
 
 func (c APIConfig) isConfigured() bool {
@@ -55,6 +62,10 @@ func (c APIConfig) isConfigured() bool {
 	default:
 		return false
 	}
+}
+
+func (c APIConfig) Configured() bool {
+	return c.isConfigured()
 }
 
 type VerifyConfig struct {
@@ -129,6 +140,7 @@ type deviceCache struct {
 type deviceStore struct {
 	mu        sync.RWMutex
 	refreshMu sync.Mutex
+	policyMu  map[string]*sync.Mutex
 	configs   []APIConfig
 	cache     map[string]deviceCache
 	client    *http.Client
@@ -151,6 +163,7 @@ func newDeviceStore(cfg VerifyConfig) *deviceStore {
 	cfg = normalizeVerifyConfig(cfg)
 	configs := append([]APIConfig(nil), cfg.APIs...)
 	cache := make(map[string]deviceCache, len(configs))
+	policyMu := make(map[string]*sync.Mutex, len(configs))
 	for i := range configs {
 		if strings.TrimSpace(configs[i].Tailnet) == "" {
 			configs[i].Tailnet = "-"
@@ -161,10 +174,12 @@ func newDeviceStore(cfg VerifyConfig) *deviceStore {
 	}
 	for _, instance := range configs {
 		cache[instance.Name] = deviceCache{devices: map[string]Device{}}
+		policyMu[instance.Name] = &sync.Mutex{}
 	}
 	return &deviceStore{
 		configs:  configs,
 		cache:    cache,
+		policyMu: policyMu,
 		client:   &http.Client{Timeout: deviceRequestTimeout},
 		baseURL:  mustParseURL(deviceAPIBaseURL),
 		interval: cfg.SyncInterval,
@@ -441,9 +456,13 @@ type verifier struct {
 }
 
 func newVerifier(cfg VerifyConfig, track *tracker.PeerTracker) *verifier {
+	return newVerifierWithContext(context.Background(), cfg, track)
+}
+
+func newVerifierWithContext(ctx context.Context, cfg VerifyConfig, track *tracker.PeerTracker) *verifier {
 	cfg = normalizeVerifyConfig(cfg)
 	store := newDeviceStore(cfg)
-	store.start(context.Background())
+	store.start(ctx)
 	localClient := &local.Client{}
 	if cfg.TailscaledSocketEnabled {
 		localClient.Socket = cfg.TailscaledSocket
@@ -498,7 +517,6 @@ func (v *verifier) refresh(ctx context.Context) DevicesResponse {
 	_ = v.store.refresh(ctx)
 	return v.store.snapshot()
 }
-
 
 func handleDevices(verifier *verifier) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {

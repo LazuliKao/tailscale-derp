@@ -10,7 +10,9 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/LazuliKao/tailscale-derp/internal/endpoint"
 	opsapi "github.com/LazuliKao/tailscale-derp/internal/ops"
 )
 
@@ -38,6 +40,84 @@ func TestBuildConfig_DefaultsWithoutUCI(t *testing.T) {
 	}
 	if cfg.Health != ":9912" {
 		t.Fatalf("expected default health addr :9912, got %q", cfg.Health)
+	}
+	if cfg.External.Enabled || cfg.External.ValidateEndpoint {
+		t.Fatal("expected external endpoint management and validation disabled by default")
+	}
+	if strings.Join(cfg.External.Methods, ",") != "pcp,natpmp,upnp" || cfg.External.WANInterface != "auto" {
+		t.Fatalf("unexpected external discovery defaults: %+v", cfg.External)
+	}
+	if cfg.External.DERPPort != "auto" || cfg.External.STUNPort != "auto" {
+		t.Fatalf("expected automatic external ports, got DERP=%q STUN=%q", cfg.External.DERPPort, cfg.External.STUNPort)
+	}
+	if cfg.External.LeaseDuration != 2*time.Hour || cfg.External.RetryInterval != time.Minute || cfg.External.SyncInterval != 5*time.Minute {
+		t.Fatalf("unexpected external timing defaults: %+v", cfg.External)
+	}
+}
+
+func TestBuildConfig_AppliesExternalAndDERPMapSync(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := tempDir + "/tailscale-derp"
+	content := `config tls 'tls'
+	option certfile '/etc/derp/cert.pem'
+	option keyfile '/etc/derp/key.pem'
+
+config external 'external'
+	option enabled '1'
+	list method 'upnp'
+	list method 'natpmp'
+	option wan_interface 'wan'
+	option derp_port '8443'
+	option stun_port '5349'
+	option lease_seconds '3600'
+	option retry_seconds '30'
+	option sync_interval '120'
+	option validate_endpoint '1'
+
+config verify_api 'primary'
+	option label 'Primary'
+	option tailnet '-'
+	option api_key 'tskey-api-primary'
+	option derpmap_sync '1'
+	option region_id '901'
+	option region_code 'router'
+	option region_name 'Router DERP'
+	option node_name 'router-1'
+	option hostname 'derp.example.com'
+	option cert_name 'tls.example.com'
+`
+	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := buildConfig([]string{"--config", configPath}, parseUCIConfig)
+	if err != nil {
+		t.Fatalf("build config: %v", err)
+	}
+	if !cfg.External.Enabled || !cfg.External.ValidateEndpoint || !cfg.External.TLSConfigured {
+		t.Fatalf("unexpected external flags: %+v", cfg.External)
+	}
+	if strings.Join(cfg.External.Methods, ",") != "upnp,natpmp" || cfg.External.WANInterface != "wan" {
+		t.Fatalf("unexpected external discovery config: %+v", cfg.External)
+	}
+	if cfg.External.DERPPort != "8443" || cfg.External.STUNPort != "5349" {
+		t.Fatalf("unexpected external ports: %+v", cfg.External)
+	}
+	if cfg.External.LeaseDuration != time.Hour || cfg.External.RetryInterval != 30*time.Second || cfg.External.SyncInterval != 2*time.Minute {
+		t.Fatalf("unexpected external timing config: %+v", cfg.External)
+	}
+	if len(cfg.Verify.APIs) != 1 {
+		t.Fatalf("expected one API instance, got %d", len(cfg.Verify.APIs))
+	}
+	api := cfg.Verify.APIs[0]
+	if !api.DERPMapSync || api.RegionID != 901 || api.RegionCode != "router" || api.RegionName != "Router DERP" || api.NodeName != "router-1" || api.Hostname != "derp.example.com" || api.CertName != "tls.example.com" {
+		t.Fatalf("unexpected DERP map sync config: %+v", api)
+	}
+	if len(cfg.External.ValidationNames) != 1 || cfg.External.ValidationNames[0] != "tls.example.com" {
+		t.Fatalf("unexpected validation names: %v", cfg.External.ValidationNames)
+	}
+	if err := validateConfig(cfg); err != nil {
+		t.Fatalf("validate config: %v", err)
 	}
 }
 
@@ -85,7 +165,6 @@ func TestBuildConfig_AppliesUCIConfig(t *testing.T) {
 		t.Fatalf("unexpected ops config: %+v", cfg)
 	}
 }
-
 
 func TestBuildConfig_AppliesCustomTailscaledSocketSettings(t *testing.T) {
 	parsed := &uciConfig{values: map[string]map[string][]string{
@@ -219,11 +298,11 @@ func TestStatusFromConfig_RecoversAfterError(t *testing.T) {
 	state.setRunning(true)
 
 	status := statusFromConfig(&Config{
-		Listen:  ":3478",
-		STUN:    true,
-		Mesh:    true,
+		Listen:    ":3478",
+		STUN:      true,
+		Mesh:      true,
 		OpsSocket: defaultOpsSocket,
-		Health:  ":9912",
+		Health:    ":9912",
 	}, state)
 
 	if !status.Running {
@@ -261,8 +340,8 @@ func TestValidateConfig_EmptyListen(t *testing.T) {
 
 func TestValidateConfig_MeshWithoutKey(t *testing.T) {
 	cfg := &Config{
-		Listen:  ":3478",
-		Mesh:    true,
+		Listen:    ":3478",
+		Mesh:      true,
 		OpsSocket: defaultOpsSocket,
 	}
 	err := validateConfig(cfg)
@@ -276,9 +355,9 @@ func TestValidateConfig_MeshWithoutKey(t *testing.T) {
 
 func TestValidateConfig_MeshWithKey(t *testing.T) {
 	cfg := &Config{
-		Listen:  ":3478",
-		Mesh:    true,
-		MeshKey: "shared-mesh-key",
+		Listen:    ":3478",
+		Mesh:      true,
+		MeshKey:   "shared-mesh-key",
 		OpsSocket: defaultOpsSocket,
 	}
 	if err := validateConfig(cfg); err != nil {
@@ -318,13 +397,59 @@ func TestValidateConfig_KeyFileWithoutCertFile(t *testing.T) {
 
 func TestValidateConfig_BothTLSFiles(t *testing.T) {
 	cfg := &Config{
-		Listen:   ":3478",
-		CertFile: "/path/to/cert.pem",
-		KeyFile:  "/path/to/key.pem",
+		Listen:    ":3478",
+		CertFile:  "/path/to/cert.pem",
+		KeyFile:   "/path/to/key.pem",
 		OpsSocket: defaultOpsSocket,
 	}
 	if err := validateConfig(cfg); err != nil {
 		t.Fatalf("expected no error, got: %v", err)
+	}
+}
+
+func TestValidateConfig_ExternalEndpoint(t *testing.T) {
+	valid := func() *Config {
+		return &Config{
+			Listen:   ":3478",
+			CertFile: "/path/to/cert.pem",
+			KeyFile:  "/path/to/key.pem",
+			External: endpoint.Config{
+				Enabled:       true,
+				Methods:       []string{"pcp", "natpmp", "upnp"},
+				DERPPort:      "auto",
+				STUNPort:      "auto",
+				TLSConfigured: true,
+			},
+			Verify: opsapi.VerifyConfig{APIs: []opsapi.APIConfig{{
+				Name: "primary", Tailnet: "-", AuthType: opsapi.APIAuthTypeAPIKey, APIKey: "secret",
+				DERPMapSync: true, RegionID: 901, RegionCode: "router", RegionName: "Router DERP",
+				NodeName: "router-1", Hostname: "derp.example.com",
+			}}},
+		}
+	}
+
+	tests := []struct {
+		name string
+		edit func(*Config)
+		want string
+	}{
+		{"missing TLS", func(cfg *Config) { cfg.External.TLSConfigured = false }, "requires TLS"},
+		{"unsupported method", func(cfg *Config) { cfg.External.Methods = []string{"igd"} }, "unsupported method"},
+		{"invalid port", func(cfg *Config) { cfg.External.DERPPort = "70000" }, "must be auto"},
+		{"external disabled", func(cfg *Config) { cfg.External.Enabled = false }, "requires external.enabled"},
+		{"missing credentials", func(cfg *Config) { cfg.Verify.APIs[0].APIKey = "" }, "requires tailnet and API credentials"},
+		{"reserved region", func(cfg *Config) { cfg.Verify.APIs[0].RegionID = 100 }, "between 900 and 999"},
+		{"missing metadata", func(cfg *Config) { cfg.Verify.APIs[0].NodeName = "" }, "metadata is incomplete"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := valid()
+			test.edit(cfg)
+			err := validateConfig(cfg)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validateConfig() error = %v, want substring %q", err, test.want)
+			}
+		})
 	}
 }
 
@@ -584,10 +709,10 @@ func TestStatusEndpoint(t *testing.T) {
 
 func TestStatusEndpoint_ServiceUnavailable(t *testing.T) {
 	cfg := &Config{
-		Listen:  ":3478",
-		STUN:    false,
-		Mesh:    false,
-		Health:  ":9912",
+		Listen: ":3478",
+		STUN:   false,
+		Mesh:   false,
+		Health: ":9912",
 	}
 	state := &runtimeState{}
 	state.setError(fmt.Errorf("derp listener unavailable"))
@@ -679,11 +804,11 @@ func TestConfig_PeerParsing(t *testing.T) {
 
 func TestConfig_DefaultValues(t *testing.T) {
 	cfg := &Config{
-		Enabled: true,
-		Listen:  ":3478",
-		STUN:    true,
+		Enabled:   true,
+		Listen:    ":3478",
+		STUN:      true,
 		OpsSocket: defaultOpsSocket,
-		Health:     ":9912",
+		Health:    ":9912",
 	}
 	if !cfg.Enabled {
 		t.Fatal("expected Enabled to be true")

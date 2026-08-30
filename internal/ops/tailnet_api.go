@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/netip"
 	"strings"
+	"sync"
 
 	"github.com/LazuliKao/tailscale-derp/internal/httpjson"
 	tailscaleapi "tailscale.com/client/tailscale/v2"
@@ -118,6 +119,16 @@ func (s *deviceStore) updateCachedIPv4(instanceName, deviceID, ipv4 string) {
 }
 
 func (s *deviceStore) policyRaw(ctx context.Context, instanceName string) (*tailscaleapi.RawACL, error) {
+	lock, err := s.policyLock(instanceName)
+	if err != nil {
+		return nil, err
+	}
+	lock.Lock()
+	defer lock.Unlock()
+	return s.policyRawUnlocked(ctx, instanceName)
+}
+
+func (s *deviceStore) policyRawUnlocked(ctx context.Context, instanceName string) (*tailscaleapi.RawACL, error) {
 	instance, err := s.apiInstance(instanceName)
 	if err != nil {
 		return nil, err
@@ -128,6 +139,16 @@ func (s *deviceStore) policyRaw(ctx context.Context, instanceName string) (*tail
 }
 
 func (s *deviceStore) setPolicy(ctx context.Context, instanceName, hujson, etag string) error {
+	lock, err := s.policyLock(instanceName)
+	if err != nil {
+		return err
+	}
+	lock.Lock()
+	defer lock.Unlock()
+	return s.setPolicyUnlocked(ctx, instanceName, hujson, etag)
+}
+
+func (s *deviceStore) setPolicyUnlocked(ctx context.Context, instanceName, hujson, etag string) error {
 	instance, err := s.apiInstance(instanceName)
 	if err != nil {
 		return err
@@ -142,6 +163,16 @@ func (s *deviceStore) setPolicy(ctx context.Context, instanceName, hujson, etag 
 }
 
 func (s *deviceStore) validatePolicy(ctx context.Context, instanceName, hujson string) error {
+	lock, err := s.policyLock(instanceName)
+	if err != nil {
+		return err
+	}
+	lock.Lock()
+	defer lock.Unlock()
+	return s.validatePolicyUnlocked(ctx, instanceName, hujson)
+}
+
+func (s *deviceStore) validatePolicyUnlocked(ctx context.Context, instanceName, hujson string) error {
 	instance, err := s.apiInstance(instanceName)
 	if err != nil {
 		return err
@@ -149,6 +180,19 @@ func (s *deviceStore) validatePolicy(ctx context.Context, instanceName, hujson s
 	ctx, cancel := context.WithTimeout(ctx, deviceRequestTimeout)
 	defer cancel()
 	return s.apiClient(instance).PolicyFile().Validate(ctx, hujson)
+}
+
+func (s *deviceStore) policyLock(instanceName string) (*sync.Mutex, error) {
+	if _, err := s.apiInstance(instanceName); err != nil {
+		return nil, err
+	}
+	s.mu.RLock()
+	lock := s.policyMu[instanceName]
+	s.mu.RUnlock()
+	if lock == nil {
+		return nil, errUnknownAPIInstance
+	}
+	return lock, nil
 }
 
 func handleAPIInstances(store *deviceStore) http.HandlerFunc {

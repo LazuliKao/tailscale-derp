@@ -69,4 +69,3 @@ func (l *cleanupUnixListener) Close() error {
 	})
 	return closeErr
 }
-

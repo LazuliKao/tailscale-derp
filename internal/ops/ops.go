@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"time"
 
+	"github.com/LazuliKao/tailscale-derp/internal/endpoint"
 	"github.com/LazuliKao/tailscale-derp/internal/httpjson"
 	"github.com/LazuliKao/tailscale-derp/internal/service"
 	"github.com/LazuliKao/tailscale-derp/internal/tracker"
@@ -34,6 +35,7 @@ type Config struct {
 	TrafficPersist  bool
 	TrafficPath     string
 	TrafficInterval int
+	ExternalEnabled bool
 }
 
 type Status struct {
@@ -61,6 +63,8 @@ type Status struct {
 	AcceptsTotal       int64    `json:"acceptsTotal,omitempty"`
 	BytesRecvTotal     int64    `json:"bytesRecvTotal,omitempty"`
 	BytesSentTotal     int64    `json:"bytesSentTotal,omitempty"`
+	ExternalEnabled    bool     `json:"externalEnabled"`
+	ExternalState      string   `json:"externalState,omitempty"`
 }
 
 type ActionResult struct {
@@ -132,6 +136,7 @@ func StatusFromConfig(cfg Config, snapshot Snapshot, mf MetricsFunc, tf TrafficF
 		TrafficPersist:     cfg.TrafficPersist,
 		TrafficPath:        cfg.TrafficPath,
 		TrafficInterval:    cfg.TrafficInterval,
+		ExternalEnabled:    cfg.ExternalEnabled,
 		Error:              errMsg,
 	}
 
@@ -233,7 +238,6 @@ func HandleVersion(version string) http.HandlerFunc {
 	}
 }
 
-
 var errVerifyNetwork = fmt.Errorf("network error")
 
 func checkVerifyURL(baseURL, clientKey string) error {
@@ -298,13 +302,31 @@ func HandlePeers(t *tracker.PeerTracker) http.HandlerFunc {
 }
 
 func NewMux(cfg Config, snapshot Snapshot, executor Executor, mf MetricsFunc, t *tracker.PeerTracker, tf TrafficFunc) http.Handler {
+	runtime := NewRuntime(context.Background(), cfg.Verify, t)
+	return NewMuxWithRuntime(cfg, snapshot, executor, mf, t, tf, runtime, nil)
+}
+
+func NewMuxWithRuntime(cfg Config, snapshot Snapshot, executor Executor, mf MetricsFunc, t *tracker.PeerTracker, tf TrafficFunc, runtime *Runtime, external *endpoint.Manager) http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/status", HandleStatus(cfg, snapshot, mf, tf))
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			httpjson.Write(w, http.StatusMethodNotAllowed, map[string]string{"error": "GET required"})
+			return
+		}
+		status := StatusFromConfig(cfg, snapshot, mf, tf)
+		if external != nil {
+			status.ExternalState = external.Status().State
+		}
+		httpjson.Write(w, http.StatusOK, status)
+	})
 	mux.HandleFunc("/health", HandleHealth)
 	mux.HandleFunc("/version", HandleVersion(cfg.Version))
 	mux.HandleFunc("/ops", HandleOpsWithExecutor(executor))
 
-	verifier := newVerifier(cfg.Verify, t)
+	if runtime == nil {
+		runtime = NewRuntime(context.Background(), cfg.Verify, t)
+	}
+	verifier := runtime.verifier
 	mux.HandleFunc("/devices", handleDevices(verifier))
 	mux.HandleFunc("/devices/refresh", handleDevicesRefresh(verifier))
 	mux.HandleFunc("GET /tailnets", handleAPIInstances(verifier.store))
@@ -323,6 +345,14 @@ func NewMux(cfg Config, snapshot Snapshot, executor Executor, mf MetricsFunc, t 
 	mux.HandleFunc("GET /tailnets/{instance}/acl", handlePolicyGet(verifier.store))
 	mux.HandleFunc("POST /tailnets/{instance}/acl/validate", handlePolicyValidate(verifier.store))
 	mux.HandleFunc("PUT /tailnets/{instance}/acl", handlePolicySet(verifier.store))
+	if external != nil {
+		mux.HandleFunc("GET /external", func(w http.ResponseWriter, _ *http.Request) {
+			httpjson.Write(w, http.StatusOK, external.Status())
+		})
+		mux.HandleFunc("POST /external/reconcile", handleExternalAction(external.Reconcile))
+		mux.HandleFunc("POST /external/check", handleExternalAction(external.Check))
+		mux.HandleFunc("POST /external/sync", handleExternalAction(external.Sync))
+	}
 
 	if t != nil {
 		mux.HandleFunc("/peers", HandlePeers(t))
@@ -330,4 +360,14 @@ func NewMux(cfg Config, snapshot Snapshot, executor Executor, mf MetricsFunc, t 
 
 	mux.HandleFunc("/clients", HandleClients(mf))
 	return mux
+}
+
+func handleExternalAction(action func(context.Context) error) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if err := action(r.Context()); err != nil {
+			httpjson.Write(w, http.StatusBadGateway, map[string]string{"result": "error", "error": err.Error()})
+			return
+		}
+		httpjson.Write(w, http.StatusOK, map[string]string{"result": "ok"})
+	}
 }
