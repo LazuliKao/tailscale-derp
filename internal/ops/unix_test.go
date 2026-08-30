@@ -1,9 +1,7 @@
 package ops
 
 import (
-	"io"
 	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -71,33 +69,6 @@ func TestListenUnixRejectsLiveSocketAndReplacesStaleSocket(t *testing.T) {
 	defer replacement.Close()
 }
 
-func TestUnixHTTPTransport(t *testing.T) {
-	path := testSocketPath(t, false)
-	listener, err := ListenUnix(path)
-	if err != nil {
-		t.Fatalf("ListenUnix: %v", err)
-	}
-	defer listener.Close()
-
-	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/verify" {
-			t.Errorf("unexpected path %q", r.URL.Path)
-		}
-		io.WriteString(w, "ok")
-	})}
-	go server.Serve(listener)
-	defer server.Close()
-
-	client := &http.Client{Transport: NewUnixHTTPTransport(path)}
-	resp, err := client.Get("http://unix/verify")
-	if err != nil {
-		t.Fatalf("GET over Unix socket: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200, got %d", resp.StatusCode)
-	}
-}
 
 func TestListenUnixDoesNotRemoveRegularFile(t *testing.T) {
 	path := testSocketPath(t, false)

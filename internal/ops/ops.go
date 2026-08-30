@@ -1,11 +1,13 @@
 package ops
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os/exec"
 	"time"
@@ -14,6 +16,9 @@ import (
 	"github.com/LazuliKao/tailscale-derp/internal/service"
 	"github.com/LazuliKao/tailscale-derp/internal/tracker"
 	"github.com/LazuliKao/tailscale-derp/internal/traffic"
+
+	"tailscale.com/tailcfg"
+	"tailscale.com/types/key"
 )
 
 const verifyTimeout = 5 * time.Second
@@ -72,6 +77,29 @@ type MetricsFunc func() json.RawMessage
 
 type TrafficFunc func() *traffic.Stats
 
+// VerifyClientFunc is suitable for derpserver.Server.SetVerifyClientFunc.
+// It receives a client's context, node key, and source IP and returns a
+// rejection error when no configured verification mechanism allows the node.
+type VerifyClientFunc func(context.Context, key.NodePublic, netip.Addr) error
+
+// NewVerifyClientFunc constructs an in-process admission verifier using the
+// configured URL, tailscaled, and Tailscale API mechanisms. These mechanisms
+// retain their existing OR semantics: any enabled mechanism may allow a
+// client. The returned callback is intended to be passed directly to the
+// local derpserver package; it never uses the daemon's HTTP handlers.
+func NewVerifyClientFunc(cfg VerifyConfig, track *tracker.PeerTracker) VerifyClientFunc {
+	verifier := newVerifier(cfg, track)
+	return func(ctx context.Context, nodeKey key.NodePublic, source netip.Addr) error {
+		if verifier.verify(ctx, tailcfg.DERPAdmitClientRequest{
+			NodePublic: nodeKey,
+			Source:     source,
+		}, source.String()) {
+			return nil
+		}
+		return fmt.Errorf("client %v not authorized by configured verifier", nodeKey)
+	}
+
+}
 func StatusFromConfig(cfg Config, snapshot Snapshot, mf MetricsFunc, tf TrafficFunc) Status {
 	running := true
 	errMsg := ""
@@ -205,16 +233,6 @@ func HandleVersion(version string) http.HandlerFunc {
 	}
 }
 
-// HandleVerify is retained as a compatibility wrapper for callers that only
-// configure Verify URLs. The failOpen argument is intentionally ignored.
-func HandleVerify(urls []string, failOpen bool, t *tracker.PeerTracker) http.HandlerFunc {
-	_ = failOpen
-	return handleVerify(newVerifier(VerifyConfig{
-		Enabled:     true,
-		URLsEnabled: true,
-		URLs:        urls,
-	}, t))
-}
 
 var errVerifyNetwork = fmt.Errorf("network error")
 
@@ -287,7 +305,6 @@ func NewMux(cfg Config, snapshot Snapshot, executor Executor, mf MetricsFunc, t 
 	mux.HandleFunc("/ops", HandleOpsWithExecutor(executor))
 
 	verifier := newVerifier(cfg.Verify, t)
-	mux.HandleFunc("/verify", handleVerify(verifier))
 	mux.HandleFunc("/devices", handleDevices(verifier))
 	mux.HandleFunc("/devices/refresh", handleDevicesRefresh(verifier))
 	mux.HandleFunc("GET /tailnets", handleAPIInstances(verifier.store))

@@ -1,0 +1,12 @@
+This package is copied from the upstream Tailscale derpserver package.
+
+Upstream module: tailscale.com
+Upstream version: v1.102.3
+Upstream repository: https://github.com/tailscale/tailscale
+Upstream Git revision: 53a0d659afa51835dd7a9283873cca44261454f8
+Upstream tag: refs/tags/v1.102.3
+Go module sum: h1:M1czCAtMuIcg+2Z+FBPbJyAk3ZEQGEFKnvHthtE1c6M=
+
+Only the non-test runtime files needed by this daemon were copied. The copied
+files retain their upstream copyright and SPDX license headers. Local changes
+are limited to the client-admission callback API documented in derpserver.go.

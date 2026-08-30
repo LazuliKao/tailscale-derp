@@ -1,7 +1,6 @@
 package ops
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -14,42 +13,6 @@ import (
 	"tailscale.com/types/key"
 )
 
-func TestHandleVerifyUsesStandardDERPJSONAndURL(t *testing.T) {
-	var receivedKey string
-	admission := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		receivedKey = r.URL.Query().Get("key")
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer admission.Close()
-
-	nodeKey := key.NewNode().Public()
-	verifier := newVerifier(VerifyConfig{
-		Enabled:     true,
-		URLsEnabled: true,
-		URLs:        []string{admission.URL + "/verify"},
-	}, nil)
-	requestBody, err := json.Marshal(tailcfg.DERPAdmitClientRequest{NodePublic: nodeKey})
-	if err != nil {
-		t.Fatalf("marshal request: %v", err)
-	}
-	req := httptest.NewRequest(http.MethodPost, "/verify", bytes.NewReader(requestBody))
-	resp := httptest.NewRecorder()
-	handleVerify(verifier)(resp, req)
-
-	if resp.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", resp.Code)
-	}
-	var result tailcfg.DERPAdmitClientResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if !result.Allow {
-		t.Fatal("expected URL admission to allow the client")
-	}
-	if receivedKey != nodeKey.String() {
-		t.Fatalf("expected query key %q, got %q", nodeKey, receivedKey)
-	}
-}
 
 func TestVerifierCombinesMechanismsWithOR(t *testing.T) {
 	nodeKey := key.NewNode().Public()

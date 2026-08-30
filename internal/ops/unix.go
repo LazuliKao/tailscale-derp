@@ -1,11 +1,8 @@
 package ops
 
 import (
-	"context"
 	"fmt"
 	"net"
-	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -73,35 +70,3 @@ func (l *cleanupUnixListener) Close() error {
 	return closeErr
 }
 
-// NewUnixHTTPTransport returns an HTTP transport that routes requests whose
-// host is "unix" to socketPath. Other requests retain the standard transport
-// behavior, allowing this transport to be installed as http.DefaultTransport.
-func NewUnixHTTPTransport(socketPath string) *http.Transport {
-	base, ok := http.DefaultTransport.(*http.Transport)
-	if !ok || base == nil {
-		base = &http.Transport{}
-	}
-	transport := base.Clone()
-	proxy := transport.Proxy
-	transport.Proxy = func(req *http.Request) (*url.URL, error) {
-		if req.URL.Host == "unix" {
-			return nil, nil
-		}
-		if proxy != nil {
-			return proxy(req)
-		}
-		return nil, nil
-	}
-	dialer := &net.Dialer{}
-	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-		host := address
-		if parsedHost, _, err := net.SplitHostPort(address); err == nil {
-			host = parsedHost
-		}
-		if host == "unix" {
-			return dialer.DialContext(ctx, "unix", socketPath)
-		}
-		return dialer.DialContext(ctx, network, address)
-	}
-	return transport
-}

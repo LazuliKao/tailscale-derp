@@ -2,9 +2,7 @@ package ops
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -501,22 +499,6 @@ func (v *verifier) refresh(ctx context.Context) DevicesResponse {
 	return v.store.snapshot()
 }
 
-func handleVerify(verifier *verifier) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			httpjson.Write(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
-			return
-		}
-		var request tailcfg.DERPAdmitClientRequest
-		decoder := json.NewDecoder(io.LimitReader(r.Body, 16<<10))
-		if err := decoder.Decode(&request); err != nil || request.NodePublic == (key.NodePublic{}) {
-			httpjson.Write(w, http.StatusBadRequest, map[string]string{"error": "valid DERP admission request required"})
-			return
-		}
-		allowed := verifier.verify(r.Context(), request, r.RemoteAddr)
-		httpjson.Write(w, http.StatusOK, tailcfg.DERPAdmitClientResponse{Allow: allowed})
-	}
-}
 
 func handleDevices(verifier *verifier) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {

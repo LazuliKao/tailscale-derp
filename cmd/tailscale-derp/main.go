@@ -18,19 +18,20 @@ import (
 	"sync"
 	"time"
 
+	"github.com/LazuliKao/tailscale-derp/internal/derpserver"
 	"github.com/LazuliKao/tailscale-derp/internal/httpjson"
 	opsapi "github.com/LazuliKao/tailscale-derp/internal/ops"
 	"github.com/LazuliKao/tailscale-derp/internal/service"
 	"github.com/LazuliKao/tailscale-derp/internal/tracker"
 	"github.com/LazuliKao/tailscale-derp/internal/traffic"
 
-	"tailscale.com/derp/derpserver"
 	"tailscale.com/net/stunserver"
 	"tailscale.com/types/key"
 )
 
 var version = "dev"
 var getServerMetrics opsapi.MetricsFunc
+var admissionTracker = tracker.NewPeerTracker()
 
 const (
 	defaultNodeKeyPath     = "/var/lib/tailscale-derp/node.key"
@@ -47,23 +48,19 @@ const (
 )
 
 type Config struct {
-	// VerifyClientURLs and VerifyClientFailOpen are retained for source
-	// compatibility with older callers. Verification uses Verify instead.
-	VerifyClientURLs     []string
-	VerifyClientFailOpen bool
-	Verify               opsapi.VerifyConfig
-	Enabled              bool
-	Listen               string
-	STUN                 bool
-	CertFile             string
-	KeyFile              string
-	Mesh                 bool
-	MeshKey              string
-	OpsSocket            string
-	Health               string
-	TrafficPersist       bool
-	TrafficPath          string
-	TrafficInterval      int
+	Verify          opsapi.VerifyConfig
+	Enabled         bool
+	Listen          string
+	STUN            bool
+	CertFile        string
+	KeyFile         string
+	Mesh            bool
+	MeshKey         string
+	OpsSocket       string
+	Health          string
+	TrafficPersist  bool
+	TrafficPath     string
+	TrafficInterval int
 }
 
 type Status = opsapi.Status
@@ -103,21 +100,20 @@ func (s *runtimeState) snapshot() (bool, string) {
 }
 
 type configFlags struct {
-	VerifyClientURLs     *string
-	VerifyClientFailOpen *bool
-	Enabled              *bool
-	Listen               *string
-	STUN                 *bool
-	CertFile             *string
-	KeyFile              *string
-	Mesh                 *bool
-	MeshKey              *string
-	OpsSocket            *string
-	HealthAddr           *string
-	TrafficPersist       *bool
-	TrafficPath          *string
-	TrafficInterval      *int
-	ConfigPath           *string
+	VerifyURLs      *string
+	Enabled         *bool
+	Listen          *string
+	STUN            *bool
+	CertFile        *string
+	KeyFile         *string
+	Mesh            *bool
+	MeshKey         *string
+	OpsSocket       *string
+	HealthAddr      *string
+	TrafficPersist  *bool
+	TrafficPath     *string
+	TrafficInterval *int
+	ConfigPath      *string
 }
 
 type uciSection struct {
@@ -142,21 +138,20 @@ func newFlagSet(args []string) (*flag.FlagSet, *configFlags, error) {
 	fs := flag.NewFlagSet("tailscale-derp", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	flags := &configFlags{
-		VerifyClientURLs:     fs.String("verify-client-urls", "", "comma-separated admission controller URLs for verifying clients"),
-		VerifyClientFailOpen: fs.Bool("verify-client-fail-open", false, "deprecated and ignored; verification never fails open"),
-		Enabled:              fs.Bool("enabled", false, "enable DERP service"),
-		Listen:               fs.String("listen", "", "listen address"),
-		STUN:                 fs.Bool("stun", false, "enable STUN"),
-		CertFile:             fs.String("certfile", "", "TLS certificate file"),
-		KeyFile:              fs.String("keyfile", "", "TLS key file"),
-		Mesh:                 fs.Bool("mesh", false, "enable mesh mode"),
-		MeshKey:              fs.String("mesh-key", "", "shared mesh key"),
-		OpsSocket:            fs.String("ops-socket", "", "ops server Unix socket path"),
-		HealthAddr:           fs.String("health", "", "health server address"),
-		TrafficPersist:       fs.Bool("traffic-persist", false, "enable traffic statistics persistence"),
-		TrafficPath:          fs.String("traffic-path", "", "path to traffic statistics file"),
-		TrafficInterval:      fs.Int("traffic-interval", 0, "traffic save interval in seconds"),
-		ConfigPath:           fs.String("config", defaultConfigPath(), "UCI config path"),
+		VerifyURLs:      fs.String("verify-client-urls", "", "comma-separated admission controller URLs for verifying clients"),
+		Enabled:         fs.Bool("enabled", false, "enable DERP service"),
+		Listen:          fs.String("listen", "", "listen address"),
+		STUN:            fs.Bool("stun", false, "enable STUN"),
+		CertFile:        fs.String("certfile", "", "TLS certificate file"),
+		KeyFile:         fs.String("keyfile", "", "TLS key file"),
+		Mesh:            fs.Bool("mesh", false, "enable mesh mode"),
+		MeshKey:         fs.String("mesh-key", "", "shared mesh key"),
+		OpsSocket:       fs.String("ops-socket", "", "ops server Unix socket path"),
+		HealthAddr:      fs.String("health", "", "health server address"),
+		TrafficPersist:  fs.Bool("traffic-persist", false, "enable traffic statistics persistence"),
+		TrafficPath:     fs.String("traffic-path", "", "path to traffic statistics file"),
+		TrafficInterval: fs.Int("traffic-interval", 0, "traffic save interval in seconds"),
+		ConfigPath:      fs.String("config", defaultConfigPath(), "UCI config path"),
 	}
 
 	if err := fs.Parse(args); err != nil {
@@ -416,8 +411,7 @@ func applyUCIConfig(cfg *Config, parsed *uciConfig) error {
 			}
 		}
 	}
-	cfg.VerifyClientURLs = verifyURLs
-	cfg.Verify.URLs = append([]string(nil), verifyURLs...)
+	cfg.Verify.URLs = verifyURLs
 
 	verifyEnabledSet := false
 	if value, ok := parsed.first("verify", "enabled"); ok {
@@ -600,20 +594,14 @@ func applyFlagOverrides(cfg *Config, fs *flag.FlagSet, flags *configFlags) {
 		cfg.TrafficInterval = *flags.TrafficInterval
 	}
 	if stringFlagProvided(fs, "verify-client-urls") {
-		for _, part := range strings.Split(*flags.VerifyClientURLs, ",") {
+		for _, part := range strings.Split(*flags.VerifyURLs, ",") {
 			trimmed := strings.TrimSpace(part)
 			if trimmed != "" {
-				cfg.VerifyClientURLs = append(cfg.VerifyClientURLs, trimmed)
 				cfg.Verify.URLs = append(cfg.Verify.URLs, trimmed)
 			}
 		}
 		cfg.Verify.Enabled = true
 		cfg.Verify.URLsEnabled = true
-	}
-	if boolFlagProvided(fs, "verify-client-fail-open") {
-		// Kept only so older service invocations remain accepted. Fail-open is
-		// intentionally no longer applied to any verification mechanism.
-		cfg.VerifyClientFailOpen = false
 	}
 }
 
@@ -666,21 +654,10 @@ func startDERP(cfg *Config, state *runtimeState, persister *traffic.Persister) e
 			return fmt.Errorf("parse mesh key: %w", err)
 		}
 	}
-	opsSocket := cfg.OpsSocket
-	if opsSocket == "" {
-		opsSocket = defaultOpsSocket
-	}
-	server.SetVerifyClient(false)
-	server.SetVerifyClientURLFailOpen(false)
 	if cfg.Verify.Enabled {
-		admissionURL := "http://unix/verify"
-		// derpserver performs this request through http.DefaultClient. Route it
-		// to the Ops Unix socket using a valid synthetic host.
-		http.DefaultTransport = opsapi.NewUnixHTTPTransport(opsSocket)
-		server.SetVerifyClientURL(admissionURL)
-		log.Printf("Client verification enabled at %s (urls: %v, tailscaled: %v, official API: %v)", admissionURL, cfg.Verify.URLsEnabled, cfg.Verify.TailscaledEnabled, cfg.Verify.APIEnabled)
+		server.SetVerifyClientFunc(opsapi.NewVerifyClientFunc(cfg.Verify, admissionTracker))
+		log.Printf("Client verification enabled (urls: %v, tailscaled: %v, official API: %v)", cfg.Verify.URLsEnabled, cfg.Verify.TailscaledEnabled, cfg.Verify.APIEnabled)
 	} else {
-		server.SetVerifyClientURL("")
 		log.Printf("Client verification disabled")
 	}
 	serverExpVar := publishDERPMetrics(server)
@@ -869,12 +846,8 @@ func statusFromConfigWithTraffic(cfg *Config, state *runtimeState, persister *tr
 }
 
 func opsConfig(cfg *Config) opsapi.Config {
-	verify := cfg.Verify
-	if len(verify.URLs) == 0 && len(cfg.VerifyClientURLs) > 0 {
-		verify.URLs = append([]string(nil), cfg.VerifyClientURLs...)
-	}
 	return opsapi.Config{
-		Verify:          verify,
+		Verify:          cfg.Verify,
 		Version:         version,
 		Listen:          cfg.Listen,
 		STUN:            cfg.STUN,
@@ -908,10 +881,9 @@ func startOps(cfg *Config, state *runtimeState, persister *traffic.Persister) er
 	if state != nil {
 		snapshot = state.snapshot
 	}
-	t := tracker.NewPeerTracker()
 	server := &http.Server{
 		Addr:              listenAddr,
-		Handler:           opsapi.NewMux(opsConfig(cfg), snapshot, execServiceAction, getServerMetrics, t, trafficTotalsFunc(persister)),
+		Handler:           opsapi.NewMux(opsConfig(cfg), snapshot, execServiceAction, getServerMetrics, admissionTracker, trafficTotalsFunc(persister)),
 		ReadHeaderTimeout: opsReadHeaderTimeout,
 		ReadTimeout:       opsReadTimeout,
 		WriteTimeout:      opsWriteTimeout,
