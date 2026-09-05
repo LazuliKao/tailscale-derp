@@ -37,6 +37,9 @@ func (r *Runtime) reconcileDERPMaps(ctx context.Context, value *endpoint.Endpoin
 		if !cfg.DERPMapSync {
 			continue
 		}
+		if r.certificateNames != nil {
+			cfg.CertName = r.certificateNames.CertName()
+		}
 		status := endpoint.InstanceStatus{Name: cfg.Name, Label: cfg.Label, State: "syncing", LastAttempt: time.Now().UTC().Format(time.RFC3339)}
 		err := store.reconcileDERPMap(ctx, cfg, value, withdraw)
 		if err != nil {

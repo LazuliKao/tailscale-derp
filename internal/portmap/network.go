@@ -125,3 +125,28 @@ func sourceIPv4(gateway netip.Addr, interfaceName string) (netip.Addr, error) {
 	}
 	return addr.Unmap(), nil
 }
+
+func publicIPv4(interfaceName string) (netip.Addr, error) {
+	if interfaceName == "" || interfaceName == "auto" {
+		var err error
+		interfaceName, _, err = defaultRoute("auto")
+		if err != nil {
+			return netip.Addr{}, err
+		}
+	}
+	iface, err := net.InterfaceByName(interfaceName)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	addresses, err := iface.Addrs()
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	for _, address := range addresses {
+		prefix, err := netip.ParsePrefix(address.String())
+		if err == nil && IsPublicIPv4(prefix.Addr()) {
+			return prefix.Addr(), nil
+		}
+	}
+	return netip.Addr{}, fmt.Errorf("interface %s has no public IPv4 address", interfaceName)
+}

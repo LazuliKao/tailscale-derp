@@ -13,6 +13,7 @@ import (
 type fakeMapper struct {
 	err         error
 	fingerprint string
+	publicIP    netip.Addr
 	calls       int
 }
 
@@ -32,6 +33,24 @@ func (m *fakeMapper) Map(context.Context, portmap.Request) (*portmap.Mapping, er
 func (m *fakeMapper) NetworkFingerprint(string) (string, error) {
 	return m.fingerprint, nil
 }
+
+func (m *fakeMapper) PublicIPv4(string) (netip.Addr, error) {
+	if !m.publicIP.IsValid() {
+		return netip.Addr{}, errors.New("no public IPv4")
+	}
+	return m.publicIP, nil
+}
+
+type fakeCertificateUpdater struct {
+	addresses []string
+}
+
+func (c *fakeCertificateUpdater) UpdateEndpointIP(address string) error {
+	c.addresses = append(c.addresses, address)
+	return nil
+}
+
+func (c *fakeCertificateUpdater) ExpectedCertHash() []byte { return nil }
 
 type fakeValidator struct {
 	pass bool
@@ -173,6 +192,33 @@ func TestNetworkChangeTriggersReconcile(t *testing.T) {
 	manager.maintain(context.Background())
 	if mapper.calls != 2 {
 		t.Fatalf("mapping calls = %d, want 2 after route change", mapper.calls)
+	}
+}
+
+func TestDirectModePublishesInterfacePublicAddress(t *testing.T) {
+	mapper := &fakeMapper{publicIP: netip.MustParseAddr("8.8.8.8")}
+	certificates := &fakeCertificateUpdater{}
+	syncer := &fakeSyncer{}
+	manager := NewManager(Config{
+		Enabled: true, Mode: ModeDirect, TLSConfigured: true, STUNEnabled: true,
+		WANInterface: "wan",
+	}, mapper, &fakeValidator{}, syncer, certificates)
+	manager.SetLocalPorts(443, 3478)
+
+	if err := manager.Reconcile(context.Background()); err != nil {
+		t.Fatalf("direct reconcile failed: %v", err)
+	}
+	if mapper.calls != 0 {
+		t.Fatalf("direct mode requested a port mapping %d times", mapper.calls)
+	}
+	if got := manager.Status().Endpoint; got == nil || got.IPv4 != "8.8.8.8" || got.DERPPort != 443 || got.STUNPort != 3478 || got.Method != ModeDirect {
+		t.Fatalf("unexpected direct endpoint: %#v", got)
+	}
+	if len(certificates.addresses) != 1 || certificates.addresses[0] != "8.8.8.8" {
+		t.Fatalf("certificate addresses = %#v", certificates.addresses)
+	}
+	if syncer.publishes != 1 {
+		t.Fatalf("publishes = %d, want 1", syncer.publishes)
 	}
 }
 

@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/LazuliKao/tailscale-derp/internal/cert"
 	"github.com/LazuliKao/tailscale-derp/internal/derpserver"
 	"github.com/LazuliKao/tailscale-derp/internal/endpoint"
 	"github.com/LazuliKao/tailscale-derp/internal/httpjson"
@@ -38,6 +39,7 @@ var admissionTracker = tracker.NewPeerTracker()
 
 const (
 	defaultNodeKeyPath     = "/var/lib/tailscale-derp/node.key"
+	defaultTLSStateDir     = "/var/lib/tailscale-derp/tls"
 	defaultListenAddr      = ":3478"
 	defaultOpsSocket       = opsapi.DefaultOpsSocketPath
 	defaultHealthAddr      = ":9912"
@@ -58,6 +60,8 @@ type Config struct {
 	STUN            bool
 	CertFile        string
 	KeyFile         string
+	TLSMode         string
+	TLSStateDir     string
 	Mesh            bool
 	MeshKey         string
 	OpsSocket       string
@@ -110,6 +114,8 @@ type configFlags struct {
 	STUN            *bool
 	CertFile        *string
 	KeyFile         *string
+	TLSSelfSigned   *bool
+	TLSStateDir     *string
 	Mesh            *bool
 	MeshKey         *string
 	OpsSocket       *string
@@ -148,6 +154,8 @@ func newFlagSet(args []string) (*flag.FlagSet, *configFlags, error) {
 		STUN:            fs.Bool("stun", false, "enable STUN"),
 		CertFile:        fs.String("certfile", "", "TLS certificate file"),
 		KeyFile:         fs.String("keyfile", "", "TLS key file"),
+		TLSSelfSigned:   fs.Bool("tls-self-signed", false, "generate and manage a self-signed TLS certificate"),
+		TLSStateDir:     fs.String("tls-state-dir", "", "automatic TLS certificate state directory"),
 		Mesh:            fs.Bool("mesh", false, "enable mesh mode"),
 		MeshKey:         fs.String("mesh-key", "", "shared mesh key"),
 		OpsSocket:       fs.String("ops-socket", "", "ops server Unix socket path"),
@@ -304,11 +312,14 @@ func buildConfig(args []string, openFile func(string) (*uciConfig, error)) (*Con
 		Health:          defaultHealthAddr,
 		TrafficPath:     defaultTrafficPath,
 		TrafficInterval: defaultTrafficInterval,
+		TLSMode:         "manual",
+		TLSStateDir:     defaultTLSStateDir,
 		Verify: opsapi.VerifyConfig{
 			SyncInterval: 5 * time.Minute,
 			CacheTTL:     15 * time.Minute,
 		},
 		External: endpoint.Config{
+			Mode:          endpoint.ModeNAT,
 			Methods:       []string{"pcp", "natpmp", "upnp"},
 			WANInterface:  "auto",
 			DERPPort:      "auto",
@@ -334,7 +345,7 @@ func buildConfig(args []string, openFile func(string) (*uciConfig, error)) (*Con
 
 	applyFlagOverrides(cfg, fs, flags)
 	cfg.External.STUNEnabled = cfg.STUN
-	cfg.External.TLSConfigured = cfg.CertFile != "" && cfg.KeyFile != ""
+	cfg.External.TLSConfigured = cfg.TLSMode == "self_signed" || (cfg.CertFile != "" && cfg.KeyFile != "")
 	if strings.TrimSpace(cfg.TrafficPath) == "" {
 		cfg.TrafficPath = defaultTrafficPath
 	}
@@ -375,6 +386,12 @@ func applyUCIConfig(cfg *Config, parsed *uciConfig) error {
 
 	if value, ok := parsed.first("tls", "keyfile"); ok {
 		cfg.KeyFile = value
+	}
+	if value, ok := parsed.first("tls", "mode"); ok && strings.TrimSpace(value) != "" {
+		cfg.TLSMode = strings.ToLower(strings.TrimSpace(value))
+	}
+	if value, ok := parsed.first("tls", "state_dir"); ok && strings.TrimSpace(value) != "" {
+		cfg.TLSStateDir = strings.TrimSpace(value)
 	}
 
 	if value, ok := parsed.first("mesh", "enabled"); ok {
@@ -423,6 +440,9 @@ func applyUCIConfig(cfg *Config, parsed *uciConfig) error {
 			return fmt.Errorf("external.enabled: %w", err)
 		}
 		cfg.External.Enabled = parsedBool
+	}
+	if value, ok := parsed.first("external", "mode"); ok && strings.TrimSpace(value) != "" {
+		cfg.External.Mode = strings.ToLower(strings.TrimSpace(value))
 	}
 	if methods := parsed.get("external", "method"); len(methods) > 0 {
 		cfg.External.Methods = nil
@@ -589,14 +609,14 @@ func applyUCIConfig(cfg *Config, parsed *uciConfig) error {
 		cfg.Verify.APIs = append(cfg.Verify.APIs, apiConfig)
 		if apiConfig.DERPMapSync {
 			validationName := apiConfig.CertName
-			if validationName == "" {
+			if cfg.TLSMode == "self_signed" || validationName == "" {
 				validationName = apiConfig.Hostname
 			}
 			cfg.External.ValidationNames = append(cfg.External.ValidationNames, validationName)
 		}
 	}
 	cfg.External.STUNEnabled = cfg.STUN
-	cfg.External.TLSConfigured = cfg.CertFile != "" && cfg.KeyFile != ""
+	cfg.External.TLSConfigured = cfg.TLSMode == "self_signed" || (cfg.CertFile != "" && cfg.KeyFile != "")
 
 	// Existing URL-only configurations remain active without requiring a
 	// manual migration. New configurations have no URL and stay disabled.
@@ -675,6 +695,16 @@ func applyFlagOverrides(cfg *Config, fs *flag.FlagSet, flags *configFlags) {
 	if stringFlagProvided(fs, "keyfile") {
 		cfg.KeyFile = strings.TrimSpace(*flags.KeyFile)
 	}
+	if boolFlagProvided(fs, "tls-self-signed") {
+		if *flags.TLSSelfSigned {
+			cfg.TLSMode = "self_signed"
+		} else {
+			cfg.TLSMode = "manual"
+		}
+	}
+	if stringFlagProvided(fs, "tls-state-dir") {
+		cfg.TLSStateDir = strings.TrimSpace(*flags.TLSStateDir)
+	}
 	if boolFlagProvided(fs, "mesh") {
 		cfg.Mesh = *flags.Mesh
 	}
@@ -718,6 +748,15 @@ func loadConfig() (*Config, error) {
 }
 
 func validateConfig(cfg *Config) error {
+	if cfg.TLSMode == "" {
+		cfg.TLSMode = "manual"
+	}
+	if cfg.External.Mode == "" {
+		cfg.External.Mode = endpoint.ModeNAT
+	}
+	if cfg.External.WANInterface == "" {
+		cfg.External.WANInterface = "auto"
+	}
 	if cfg.Listen == "" {
 		return fmt.Errorf("listen address is required")
 	}
@@ -729,6 +768,15 @@ func validateConfig(cfg *Config) error {
 	}
 	if cfg.KeyFile != "" && cfg.CertFile == "" {
 		return fmt.Errorf("keyfile requires certfile")
+	}
+	if cfg.TLSMode != "manual" && cfg.TLSMode != "self_signed" {
+		return fmt.Errorf("tls.mode must be manual or self_signed")
+	}
+	if cfg.TLSMode == "self_signed" && (cfg.CertFile != "" || cfg.KeyFile != "") {
+		return fmt.Errorf("self_signed TLS does not use certfile or keyfile")
+	}
+	if cfg.TLSMode == "self_signed" && strings.TrimSpace(cfg.TLSStateDir) == "" {
+		return fmt.Errorf("self_signed TLS requires state_dir")
 	}
 	if err := validateOptionalPortBinding("listen", cfg.Listen); err != nil {
 		return err
@@ -743,7 +791,10 @@ func validateConfig(cfg *Config) error {
 		return err
 	}
 	allowedMethods := map[string]bool{"pcp": true, "natpmp": true, "upnp": true}
-	if cfg.External.Enabled && len(cfg.External.Methods) == 0 {
+	if cfg.External.Mode != endpoint.ModeNAT && cfg.External.Mode != endpoint.ModeDirect {
+		return fmt.Errorf("external.mode must be direct or nat")
+	}
+	if cfg.External.Enabled && cfg.External.Mode == endpoint.ModeNAT && len(cfg.External.Methods) == 0 {
 		return fmt.Errorf("external requires at least one mapping method")
 	}
 	for _, method := range cfg.External.Methods {
@@ -769,9 +820,19 @@ func validateConfig(cfg *Config) error {
 		}
 	}
 	if cfg.External.Enabled && !cfg.External.TLSConfigured {
-		return fmt.Errorf("external endpoint publishing requires TLS certfile and keyfile")
+		return fmt.Errorf("external endpoint publishing requires TLS")
 	}
 	return nil
+}
+
+func selfSignedNames(cfg *Config) []string {
+	var names []string
+	for _, api := range cfg.Verify.APIs {
+		if api.DERPMapSync {
+			names = append(names, api.Hostname)
+		}
+	}
+	return names
 }
 
 func validateExternalPort(name, value string) error {
@@ -785,7 +846,7 @@ func validateExternalPort(name, value string) error {
 	return nil
 }
 
-func startDERP(ctx context.Context, cfg *Config, state *runtimeState, persister *traffic.Persister, runtime *opsapi.Runtime, external *endpoint.Manager) error {
+func startDERP(ctx context.Context, cfg *Config, state *runtimeState, persister *traffic.Persister, runtime *opsapi.Runtime, external *endpoint.Manager, automaticTLS *cert.Manager) error {
 	privateKey, err := loadOrCreateNodeKey(defaultNodeKeyPath)
 	if err != nil {
 		if state != nil {
@@ -877,6 +938,24 @@ func startDERP(ctx context.Context, cfg *Config, state *runtimeState, persister 
 	if state != nil {
 		state.setRunning(true)
 		defer state.setRunning(false)
+	}
+	if automaticTLS != nil {
+		httpServer.TLSConfig = &tls.Config{
+			GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+				certificate, err := automaticTLS.GetCertificate(hello)
+				if err != nil {
+					return nil, err
+				}
+				copy := *certificate
+				copy.Certificate = append(append([][]byte(nil), certificate.Certificate...), server.MetaCert())
+				return &copy, nil
+			},
+		}
+		err := httpServer.ServeTLS(listener, "", "")
+		if state != nil && err != nil {
+			state.setError(err)
+		}
+		return err
 	}
 	if cfg.CertFile != "" && cfg.KeyFile != "" {
 		httpServer.TLSConfig = &tls.Config{
@@ -1116,13 +1195,27 @@ func main() {
 	if cfg.TrafficPersist {
 		persister = traffic.New(true, cfg.TrafficPath, time.Duration(cfg.TrafficInterval)*time.Second, trafficSessionMetrics)
 	}
-	if cfg.External.Enabled {
+	var automaticTLS *cert.Manager
+	if cfg.TLSMode == "self_signed" {
+		automaticTLS, err = cert.NewManager(cfg.TLSStateDir, selfSignedNames(cfg))
+		if err != nil {
+			log.Fatalf("Initialize automatic TLS certificate: %v", err)
+		}
+	}
+	if cfg.External.Enabled && automaticTLS == nil {
 		if _, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile); err != nil {
 			log.Fatalf("Invalid TLS certificate for external endpoint publishing: %v", err)
 		}
 	}
 	runtime := opsapi.NewRuntime(ctx, cfg.Verify, admissionTracker)
-	external := endpoint.NewManager(cfg.External, portmap.NewClient(cfg.External.Methods), endpoint.LocalValidator{}, runtime)
+	if automaticTLS != nil {
+		runtime.SetCertificateNameProvider(automaticTLS)
+	}
+	validator := endpoint.LocalValidator{}
+	if automaticTLS != nil {
+		validator.ExpectedCertHash = automaticTLS.ExpectedCertHash
+	}
+	external := endpoint.NewManager(cfg.External, portmap.NewClient(cfg.External.Methods), validator, runtime, automaticTLS)
 	external.Start(ctx)
 
 	go func() {
@@ -1131,7 +1224,7 @@ func main() {
 		}
 	}()
 
-	if err := startDERP(ctx, cfg, state, persister, runtime, external); err != nil {
+	if err := startDERP(ctx, cfg, state, persister, runtime, external, automaticTLS); err != nil {
 		log.Fatalf("DERP server failed: %v", err)
 	}
 }

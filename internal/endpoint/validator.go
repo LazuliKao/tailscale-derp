@@ -3,6 +3,7 @@ package endpoint
 import (
 	"context"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -12,10 +13,12 @@ import (
 	"time"
 
 	"tailscale.com/net/stun"
+	"tailscale.com/net/tlsdial"
 )
 
 type LocalValidator struct {
-	Timeout time.Duration
+	Timeout          time.Duration
+	ExpectedCertHash func() []byte
 }
 
 func (v LocalValidator) Validate(ctx context.Context, endpoint Endpoint, names []string, stunEnabled bool) ValidationResult {
@@ -33,7 +36,11 @@ func (v LocalValidator) Validate(ctx context.Context, endpoint Endpoint, names [
 		return result
 	}
 	for _, name := range uniqueNames(names) {
-		if err := validateDERP(ctx, endpoint, name, timeout); err != nil {
+		var expectedHash []byte
+		if v.ExpectedCertHash != nil {
+			expectedHash = v.ExpectedCertHash()
+		}
+		if err := validateDERP(ctx, endpoint, name, timeout, expectedHash); err != nil {
 			result.Error = err.Error()
 			return result
 		}
@@ -54,14 +61,22 @@ func (v LocalValidator) Validate(ctx context.Context, endpoint Endpoint, names [
 	return result
 }
 
-func validateDERP(ctx context.Context, endpoint Endpoint, serverName string, timeout time.Duration) error {
+func validateDERP(ctx context.Context, endpoint Endpoint, serverName string, timeout time.Duration, expectedHash []byte) error {
 	serverName = strings.TrimSpace(serverName)
 	if serverName == "" {
 		return errors.New("empty TLS server name")
 	}
 	target := net.JoinHostPort(endpoint.IPv4, fmt.Sprint(endpoint.DERPPort))
+	tlsConfig := &tls.Config{ServerName: serverName, MinVersion: tls.VersionTLS12}
+	if len(expectedHash) > 0 {
+		if len(expectedHash) != 32 {
+			return errors.New("automatic TLS certificate hash is invalid")
+		}
+		// tlsdial pins the leaf while retaining DNS/IP SAN and validity checks.
+		tlsdial.SetConfigExpectedCertHash(tlsConfig, hex.EncodeToString(expectedHash))
+	}
 	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{ServerName: serverName, MinVersion: tls.VersionTLS12},
+		TLSClientConfig: tlsConfig,
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			return (&net.Dialer{Timeout: timeout}).DialContext(ctx, network, target)
 		},

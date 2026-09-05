@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,8 +15,14 @@ import (
 
 const failureThreshold = 3
 
+const (
+	ModeNAT    = "nat"
+	ModeDirect = "direct"
+)
+
 type Config struct {
 	Enabled          bool
+	Mode             string
 	Methods          []string
 	WANInterface     string
 	DERPPort         string
@@ -79,6 +86,10 @@ type networkFingerprinter interface {
 	NetworkFingerprint(string) (string, error)
 }
 
+type publicIPDiscoverer interface {
+	PublicIPv4(string) (netip.Addr, error)
+}
+
 type Validator interface {
 	Validate(context.Context, Endpoint, []string, bool) ValidationResult
 }
@@ -88,11 +99,19 @@ type Syncer interface {
 	Withdraw(context.Context) ([]InstanceStatus, error)
 }
 
+// CertificateUpdater refreshes automatic certificate SANs before an endpoint
+// is checked or published.
+type CertificateUpdater interface {
+	UpdateEndpointIP(string) error
+	ExpectedCertHash() []byte
+}
+
 type Manager struct {
 	cfg       Config
 	mapper    Mapper
 	validator Validator
 	syncer    Syncer
+	cert      CertificateUpdater
 
 	opMu sync.Mutex
 	mu   sync.RWMutex
@@ -110,7 +129,7 @@ type Manager struct {
 	status        Status
 }
 
-func NewManager(cfg Config, mapper Mapper, validator Validator, syncer Syncer) *Manager {
+func NewManager(cfg Config, mapper Mapper, validator Validator, syncer Syncer, certificates ...CertificateUpdater) *Manager {
 	if cfg.LeaseDuration <= 0 {
 		cfg.LeaseDuration = 2 * time.Hour
 	}
@@ -120,18 +139,25 @@ func NewManager(cfg Config, mapper Mapper, validator Validator, syncer Syncer) *
 	if cfg.SyncInterval <= 0 {
 		cfg.SyncInterval = 5 * time.Minute
 	}
+	if cfg.Mode == "" {
+		cfg.Mode = ModeNAT
+	}
+	var certificate CertificateUpdater
+	if len(certificates) > 0 {
+		certificate = certificates[0]
+	}
 	state := "disabled"
 	if cfg.Enabled {
 		state = "discovering"
 	}
 	return &Manager{
-		cfg: cfg, mapper: mapper, validator: validator, syncer: syncer,
+		cfg: cfg, mapper: mapper, validator: validator, syncer: syncer, cert: certificate,
 		wake: make(chan struct{}, 1),
 		status: Status{
 			Enabled: cfg.Enabled, State: state,
 			ValidationEnabled: cfg.ValidateEndpoint,
 			FailureThreshold:  failureThreshold,
-			Validation:        ValidationResult{Scope: "local_nat_loopback", State: "disabled"},
+			Validation:        ValidationResult{Scope: "local_reachability", State: "disabled"},
 		},
 	}
 }
@@ -177,7 +203,7 @@ func (m *Manager) loop(ctx context.Context) {
 
 func (m *Manager) maintain(ctx context.Context) {
 	m.mu.RLock()
-	active := m.active != nil
+	active := m.active != nil || (m.cfg.Mode == ModeDirect && m.endpoint != nil)
 	nextRenew := m.nextRenew
 	nextSync := m.nextSync
 	network := m.network
@@ -187,7 +213,7 @@ func (m *Manager) maintain(ctx context.Context) {
 	if localDERP == 0 || (m.cfg.STUNEnabled && localSTUN == 0) {
 		return
 	}
-	if active {
+	if active && m.cfg.Mode == ModeNAT {
 		if fingerprinter, ok := m.mapper.(networkFingerprinter); ok {
 			current, err := fingerprinter.NetworkFingerprint(m.cfg.WANInterface)
 			if err != nil {
@@ -272,33 +298,55 @@ func (m *Manager) reconcile(ctx context.Context, forceValidation bool) error {
 	if localDERP == 0 || (m.cfg.STUNEnabled && localSTUN == 0) {
 		return m.fail(ctx, errors.New("DERP/STUN listeners are not ready"))
 	}
-	request, err := m.mappingRequest(localDERP, localSTUN)
-	if err != nil {
-		return m.fail(ctx, err)
-	}
 	m.setAttempt("mapping")
-	mapping, err := m.mapper.Map(ctx, request)
-	if err != nil {
-		return m.fail(ctx, err)
-	}
-	candidate := Endpoint{
-		IPv4: mapping.DERP.ExternalIP.String(), DERPPort: mapping.DERP.ExternalPort,
-		STUNPort: -1, Method: mapping.Method,
-		LeaseUntil: mapping.ExpiresAt().UTC().Format(time.RFC3339),
-	}
-	if mapping.STUN != nil {
-		candidate.STUNPort = int(mapping.STUN.ExternalPort)
+	var mapping *portmap.Mapping
+	var candidate Endpoint
+	if m.cfg.Mode == ModeDirect {
+		discoverer, ok := m.mapper.(publicIPDiscoverer)
+		if !ok {
+			return m.fail(ctx, errors.New("public IPv4 discovery is unavailable"))
+		}
+		address, err := discoverer.PublicIPv4(m.cfg.WANInterface)
+		if err != nil {
+			return m.fail(ctx, fmt.Errorf("discover public IPv4: %w", err))
+		}
+		candidate = Endpoint{IPv4: address.String(), DERPPort: localDERP, STUNPort: -1, Method: ModeDirect}
+		if m.cfg.STUNEnabled {
+			candidate.STUNPort = int(localSTUN)
+		}
+	} else {
+		request, err := m.mappingRequest(localDERP, localSTUN)
+		if err != nil {
+			return m.fail(ctx, err)
+		}
+		mapping, err = m.mapper.Map(ctx, request)
+		if err != nil {
+			return m.fail(ctx, err)
+		}
+		candidate = Endpoint{IPv4: mapping.DERP.ExternalIP.String(), DERPPort: mapping.DERP.ExternalPort, STUNPort: -1, Method: mapping.Method, LeaseUntil: mapping.ExpiresAt().UTC().Format(time.RFC3339)}
+		if mapping.STUN != nil {
+			candidate.STUNPort = int(mapping.STUN.ExternalPort)
+		}
 	}
 	if !m.cfg.TLSConfigured {
 		_ = mapping.Release(context.Background())
 		return m.fail(ctx, errors.New("TLS certificate and key are required before publishing a DERP endpoint"))
 	}
-	network := ""
-	if fingerprinter, ok := m.mapper.(networkFingerprinter); ok {
-		network, err = fingerprinter.NetworkFingerprint(m.cfg.WANInterface)
-		if err != nil {
+	if m.cert != nil {
+		if err := m.cert.UpdateEndpointIP(candidate.IPv4); err != nil {
 			_ = mapping.Release(context.Background())
-			return m.fail(ctx, fmt.Errorf("inspect external network route: %w", err))
+			return m.fail(ctx, fmt.Errorf("refresh automatic TLS certificate: %w", err))
+		}
+	}
+	network := ""
+	if m.cfg.Mode == ModeNAT {
+		if fingerprinter, ok := m.mapper.(networkFingerprinter); ok {
+			var err error
+			network, err = fingerprinter.NetworkFingerprint(m.cfg.WANInterface)
+			if err != nil {
+				_ = mapping.Release(context.Background())
+				return m.fail(ctx, fmt.Errorf("inspect external network route: %w", err))
+			}
 		}
 	}
 	if m.cfg.ValidateEndpoint || forceValidation {
@@ -313,7 +361,7 @@ func (m *Manager) reconcile(ctx context.Context, forceValidation bool) error {
 		}
 	} else {
 		m.mu.Lock()
-		m.status.Validation = ValidationResult{Scope: "local_nat_loopback", State: "disabled"}
+		m.status.Validation = ValidationResult{Scope: "local_reachability", State: "disabled"}
 		m.mu.Unlock()
 	}
 
@@ -322,7 +370,11 @@ func (m *Manager) reconcile(ctx context.Context, forceValidation bool) error {
 	oldNetwork := m.network
 	m.active = mapping
 	m.endpoint = &candidate
-	m.nextRenew = midpoint(time.Now(), mapping.ExpiresAt())
+	if mapping == nil {
+		m.nextRenew = time.Now().Add(m.cfg.RetryInterval)
+	} else {
+		m.nextRenew = midpoint(time.Now(), mapping.ExpiresAt())
+	}
 	m.network = network
 	m.status.Endpoint = cloneEndpoint(&candidate)
 	m.status.FailureCount = 0

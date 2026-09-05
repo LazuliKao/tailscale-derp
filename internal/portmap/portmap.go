@@ -139,6 +139,12 @@ func (c *Client) NetworkFingerprint(interfaceName string) (string, error) {
 	return networkFingerprint(interfaceName)
 }
 
+// PublicIPv4 returns the current globally routable IPv4 address assigned to
+// the requested interface. "auto" follows the IPv4 default route.
+func (c *Client) PublicIPv4(interfaceName string) (netip.Addr, error) {
+	return publicIPv4(interfaceName)
+}
+
 func validateMapping(mapping *Mapping, request Request) error {
 	if mapping == nil || mapping.DERP == nil {
 		return errors.New("DERP TCP mapping is missing")
