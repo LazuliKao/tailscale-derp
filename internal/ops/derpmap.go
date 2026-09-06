@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/LazuliKao/tailscale-derp/internal/endpoint"
@@ -221,7 +222,7 @@ func patchDERPMap(source string, cfg APIConfig, value *endpoint.Endpoint, withdr
 func objectMember(object *hujson.Object, name string) (*hujson.Value, int) {
 	for index := range object.Members {
 		literal, ok := object.Members[index].Name.Value.(hujson.Literal)
-		if ok && literal.Kind() == '"' && literal.String() == name {
+		if ok && literal.Kind() == '"' && strings.EqualFold(literal.String(), name) {
 			return &object.Members[index].Value, index
 		}
 	}

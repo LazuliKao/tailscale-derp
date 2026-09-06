@@ -39,6 +39,64 @@ func TestPatchDERPMapPreservesUnmanagedHuJSON(t *testing.T) {
 	}
 }
 
+func TestPatchDERPMapPreservesLowerCamelCaseKeys(t *testing.T) {
+	source := `{
+  "derpMap": {
+    "omitDefaultRegions": false,
+    "regions": {
+      "900": {
+        "regionID": 900,
+        "regionCode": "old",
+        "regionName": "Old",
+        "nodes": [{
+          "name": "managed",
+          "regionID": 900,
+          "hostName": "old.example",
+          "ipv4": "192.0.2.1",
+          "derpPort": 443,
+          "stunPort": 3478,
+          "insecureForTests": true,
+        }],
+      },
+    },
+  },
+}`
+	cfg := APIConfig{RegionID: 900, RegionCode: "home", RegionName: "Home", NodeName: "managed", Hostname: "derp.example.com"}
+	updated, changed, err := patchDERPMap(source, cfg, &endpoint.Endpoint{IPv4: "8.8.8.8", DERPPort: 4443, STUNPort: 33478}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("patch reported no change")
+	}
+	for _, key := range []string{"derpMap", "omitDefaultRegions", "regions", "regionID", "regionCode", "regionName", "nodes", "name", "hostName", "ipv4", "derpPort", "stunPort"} {
+		if !strings.Contains(updated, `"`+key+`"`) {
+			t.Errorf("updated policy does not preserve lower-camel key %q:\n%s", key, updated)
+		}
+	}
+	for _, key := range []string{"Regions", "RegionID", "RegionCode", "RegionName", "Nodes", "Name", "HostName", "IPv4", "DERPPort", "STUNPort"} {
+		if strings.Contains(updated, `"`+key+`"`) {
+			t.Errorf("updated policy added duplicate PascalCase key %q:\n%s", key, updated)
+		}
+	}
+	for _, preserved := range []string{`"insecureForTests": true`, `"derp.example.com"`, `"8.8.8.8"`, "4443", "33478"} {
+		if !strings.Contains(updated, preserved) {
+			t.Errorf("updated policy does not contain %s:\n%s", preserved, updated)
+		}
+	}
+
+	withdrawn, changed, err := patchDERPMap(updated, cfg, nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed || strings.Contains(withdrawn, `"900"`) || strings.Contains(withdrawn, `"managed"`) {
+		t.Fatalf("withdrawal did not remove the lower-camel managed region:\n%s", withdrawn)
+	}
+	if !strings.Contains(withdrawn, `"omitDefaultRegions"`) {
+		t.Fatalf("withdrawal did not preserve unmanaged DERP map content:\n%s", withdrawn)
+	}
+}
+
 func TestWithdrawDERPMapRemovesOnlyManagedNode(t *testing.T) {
 	source := `{"derpMap":{"Regions":{"900":{"RegionID":900,"Nodes":[{"Name":"managed","RegionID":900},{"Name":"keep","RegionID":900}]}}}}`
 	cfg := APIConfig{RegionID: 900, NodeName: "managed"}
