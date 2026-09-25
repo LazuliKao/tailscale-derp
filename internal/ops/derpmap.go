@@ -129,7 +129,7 @@ func patchDERPMap(source string, cfg APIConfig, value *endpoint.Endpoint, withdr
 		if withdraw {
 			return source, false, nil
 		}
-		regionsValue = appendObjectMember(derpMap, "Regions", &hujson.Object{})
+		regionsValue = appendObjectMember(derpMap, "regions", &hujson.Object{})
 	}
 	regions, ok := regionsValue.Value.(*hujson.Object)
 	if !ok {
@@ -158,7 +158,7 @@ func patchDERPMap(source string, cfg APIConfig, value *endpoint.Endpoint, withdr
 		if withdraw {
 			return source, false, nil
 		}
-		nodesValue = appendObjectMember(region, "Nodes", &hujson.Array{})
+		nodesValue = appendObjectMember(region, "nodes", &hujson.Array{})
 	}
 	nodes, ok := nodesValue.Value.(*hujson.Array)
 	if !ok {
@@ -201,19 +201,19 @@ func patchDERPMap(source string, cfg APIConfig, value *endpoint.Endpoint, withdr
 		return "", false, err
 	}
 
-	setObjectString(region, "RegionCode", cfg.RegionCode)
-	setObjectString(region, "RegionName", cfg.RegionName)
-	setObjectInt(region, "RegionID", cfg.RegionID)
-	setObjectString(node, "Name", cfg.NodeName)
-	setObjectInt(node, "RegionID", cfg.RegionID)
-	setObjectString(node, "HostName", cfg.Hostname)
-	setObjectString(node, "IPv4", value.IPv4)
-	setObjectInt(node, "DERPPort", int(value.DERPPort))
-	setObjectInt(node, "STUNPort", value.STUNPort)
+	setObjectString(region, "regionCode", cfg.RegionCode)
+	setObjectString(region, "regionName", cfg.RegionName)
+	setObjectInt(region, "regionID", cfg.RegionID)
+	setObjectString(node, "name", cfg.NodeName)
+	setObjectInt(node, "regionID", cfg.RegionID)
+	setObjectString(node, "hostName", cfg.Hostname)
+	setObjectString(node, "ipv4", value.IPv4)
+	setObjectInt(node, "derpPort", int(value.DERPPort))
+	setObjectInt(node, "stunPort", value.STUNPort)
 	if cfg.CertName == "" {
 		removeObjectMember(node, "CertName")
 	} else {
-		setObjectString(node, "CertName", cfg.CertName)
+		setObjectString(node, "certName", cfg.CertName)
 	}
 	packed := string(root.Pack())
 	return packed, packed != source, nil

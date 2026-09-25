@@ -32,7 +32,7 @@ func TestPatchDERPMapPreservesUnmanagedHuJSON(t *testing.T) {
 			t.Errorf("updated policy lost %s:\n%s", preserved, updated)
 		}
 	}
-	for _, expected := range []string{`"RegionCode": "home"`, `"HostName": "derp.example.com"`, `"IPv4":"8.8.8.8"`, `"DERPPort":4443`, `"STUNPort":33478`} {
+	for _, expected := range []string{`"RegionCode": "home"`, `"HostName": "derp.example.com"`, `"ipv4":"8.8.8.8"`, `"derpPort":4443`, `"stunPort":33478`} {
 		if !strings.Contains(updated, expected) {
 			t.Errorf("updated policy does not contain %s:\n%s", expected, updated)
 		}
@@ -94,6 +94,43 @@ func TestPatchDERPMapPreservesLowerCamelCaseKeys(t *testing.T) {
 	}
 	if !strings.Contains(withdrawn, `"omitDefaultRegions"`) {
 		t.Fatalf("withdrawal did not preserve unmanaged DERP map content:\n%s", withdrawn)
+	}
+}
+
+func TestPatchDERPMapUsesLowerCamelCaseForNewRegion(t *testing.T) {
+	source := `{
+  "derpMap": {
+    "omitDefaultRegions": false,
+    "regions": {
+      "999": {
+        "regionID": 999,
+        "regionCode": "aliyun",
+        "regionName": "Aliyun",
+        "nodes": [{"name": "aliyun", "regionID": 999}],
+      },
+    },
+  },
+}`
+	cfg := APIConfig{RegionID: 900, RegionCode: "home", RegionName: "Home", NodeName: "managed", Hostname: "derp.example.com"}
+	updated, changed, err := patchDERPMap(source, cfg, &endpoint.Endpoint{IPv4: "8.8.8.8", DERPPort: 4443, STUNPort: 33478}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("patch reported no change")
+	}
+	for _, key := range []string{"regions", "regionID", "regionCode", "regionName", "nodes", "name", "hostName", "ipv4", "derpPort", "stunPort"} {
+		if !strings.Contains(updated, `"`+key+`"`) {
+			t.Errorf("new region does not contain lower-camel key %q:\n%s", key, updated)
+		}
+	}
+	for _, key := range []string{"Regions", "RegionID", "RegionCode", "RegionName", "Nodes", "Name", "HostName", "IPv4", "DERPPort", "STUNPort"} {
+		if strings.Contains(updated, `"`+key+`"`) {
+			t.Errorf("new region added PascalCase key %q:\n%s", key, updated)
+		}
+	}
+	if !strings.Contains(updated, `"999"`) || !strings.Contains(updated, `"900"`) {
+		t.Fatalf("expected both existing and new regions:\n%s", updated)
 	}
 }
 
