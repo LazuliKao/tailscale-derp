@@ -134,6 +134,27 @@ func TestPatchDERPMapUsesLowerCamelCaseForNewRegion(t *testing.T) {
 	}
 }
 
+func TestPatchDERPMapSetsAndClearsSTUNOnly(t *testing.T) {
+	source := `{"derpMap":{"regions":{"900":{"regionID":900,"nodes":[{"name":"managed","regionID":900}]}}}}`
+	cfg := APIConfig{RegionID: 900, RegionCode: "home", RegionName: "Home", NodeName: "managed", Hostname: "derp.example.com", StunOnly: true}
+	updated, changed, err := patchDERPMap(source, cfg, &endpoint.Endpoint{IPv4: "8.8.8.8", DERPPort: 4443, STUNPort: 33478}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed || !strings.Contains(updated, `"stunOnly":true`) {
+		t.Fatalf("STUN-only node was not published: %s", updated)
+	}
+
+	cfg.StunOnly = false
+	cleared, changed, err := patchDERPMap(updated, cfg, &endpoint.Endpoint{IPv4: "8.8.8.8", DERPPort: 4443, STUNPort: 33478}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed || strings.Contains(cleared, `"stunOnly"`) {
+		t.Fatalf("STUN-only marker was not cleared: %s", cleared)
+	}
+}
+
 func TestWithdrawDERPMapRemovesOnlyManagedNode(t *testing.T) {
 	source := `{"derpMap":{"Regions":{"900":{"RegionID":900,"Nodes":[{"Name":"managed","RegionID":900},{"Name":"keep","RegionID":900}]}}}}`
 	cfg := APIConfig{RegionID: 900, NodeName: "managed"}

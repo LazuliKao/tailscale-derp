@@ -79,6 +79,7 @@ config verify_api 'primary'
 	option tailnet '-'
 	option api_key 'tskey-api-primary'
 	option derpmap_sync '1'
+	option stun_only '1'
 	option region_id '901'
 	option region_code 'router'
 	option region_name 'Router DERP'
@@ -110,7 +111,7 @@ config verify_api 'primary'
 		t.Fatalf("expected one API instance, got %d", len(cfg.Verify.APIs))
 	}
 	api := cfg.Verify.APIs[0]
-	if !api.DERPMapSync || api.RegionID != 901 || api.RegionCode != "router" || api.RegionName != "Router DERP" || api.NodeName != "router-1" || api.Hostname != "derp.example.com" || api.CertName != "tls.example.com" {
+	if !api.DERPMapSync || !api.StunOnly || api.RegionID != 901 || api.RegionCode != "router" || api.RegionName != "Router DERP" || api.NodeName != "router-1" || api.Hostname != "derp.example.com" || api.CertName != "tls.example.com" {
 		t.Fatalf("unexpected DERP map sync config: %+v", api)
 	}
 	if len(cfg.External.ValidationNames) != 1 || cfg.External.ValidationNames[0] != "tls.example.com" {

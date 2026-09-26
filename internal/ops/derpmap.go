@@ -215,6 +215,11 @@ func patchDERPMap(source string, cfg APIConfig, value *endpoint.Endpoint, withdr
 	} else {
 		setObjectString(node, "certName", cfg.CertName)
 	}
+	if cfg.StunOnly {
+		setObjectBool(node, "stunOnly", true)
+	} else {
+		removeObjectMember(node, "stunOnly")
+	}
 	packed := string(root.Pack())
 	return packed, packed != source, nil
 }
@@ -260,6 +265,15 @@ func setObjectInt(object *hujson.Object, name string, value int) {
 		return
 	}
 	member.Value = hujson.Int(int64(value))
+}
+
+func setObjectBool(object *hujson.Object, name string, value bool) {
+	member, _ := objectMember(object, name)
+	if member == nil {
+		appendObjectMember(object, name, hujson.Bool(value))
+		return
+	}
+	member.Value = hujson.Bool(value)
 }
 
 func requireMatchingInt(object *hujson.Object, name string, expected int) error {

@@ -42,6 +42,7 @@ type APIConfig struct {
 	OAuthClientID     string
 	OAuthClientSecret string
 	DERPMapSync       bool
+	StunOnly          bool
 	RegionID          int
 	RegionCode        string
 	RegionName        string

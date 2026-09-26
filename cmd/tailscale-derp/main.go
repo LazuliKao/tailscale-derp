@@ -582,6 +582,14 @@ func applyUCIConfig(cfg *Config, parsed *uciConfig) error {
 			}
 			derpMapSync = parsedBool
 		}
+		stunOnly := false
+		if value := firstSectionValue(section, "stun_only"); value != "" {
+			parsedBool, err := parseBoolValue(value)
+			if err != nil {
+				return fmt.Errorf("verify_api.%s.stun_only: %w", section.name, err)
+			}
+			stunOnly = parsedBool
+		}
 		regionID := 0
 		if value := firstSectionValue(section, "region_id"); value != "" {
 			parsedRegionID, err := strconv.Atoi(value)
@@ -599,6 +607,7 @@ func applyUCIConfig(cfg *Config, parsed *uciConfig) error {
 			OAuthClientID:     firstSectionValue(section, "oauth_client_id"),
 			OAuthClientSecret: firstSectionValue(section, "oauth_client_secret"),
 			DERPMapSync:       derpMapSync,
+			StunOnly:          stunOnly,
 			RegionID:          regionID,
 			RegionCode:        firstSectionValue(section, "region_code"),
 			RegionName:        firstSectionValue(section, "region_name"),
