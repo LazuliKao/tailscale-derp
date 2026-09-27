@@ -162,6 +162,42 @@ func TestDeviceStoreExpiredCacheDoesNotAuthorize(t *testing.T) {
 	}
 }
 
+func TestDeviceStoreKeyExpiryDisabledOverridesExpiredDevice(t *testing.T) {
+	nodeKey := key.NewNode().Public()
+	now := time.Now().UTC()
+	expired := now.Add(-time.Hour).Format(time.RFC3339)
+
+	tests := []struct {
+		name              string
+		keyExpiryDisabled bool
+		wantAllowed       bool
+	}{
+		{name: "key expiry disabled", keyExpiryDisabled: true, wantAllowed: true},
+		{name: "key expiry enabled", keyExpiryDisabled: false, wantAllowed: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &deviceStore{
+				cache: map[string]deviceCache{
+					"primary": {
+						devices: map[string]Device{nodeKey.String(): {
+							NodeKey:           nodeKey.String(),
+							Authorized:        true,
+							Expires:           expired,
+							KeyExpiryDisabled: tt.keyExpiryDisabled,
+						}},
+						lastSuccess: now,
+					},
+				},
+				ttl: time.Hour,
+			}
+			if got := store.allowed(nodeKey, now); got != tt.wantAllowed {
+				t.Fatalf("allowed() = %v, want %v", got, tt.wantAllowed)
+			}
+		})
+	}
+}
+
 func TestDeviceStoreUnionAndSources(t *testing.T) {
 	nodeKey := key.NewNode().Public().String()
 	now := time.Now()

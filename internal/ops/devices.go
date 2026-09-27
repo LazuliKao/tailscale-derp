@@ -349,7 +349,7 @@ func (s *deviceStore) allowed(nodeKey key.NodePublic, now time.Time) bool {
 			continue
 		}
 		device, ok := entry.devices[needle]
-		if ok && device.Authorized && !deviceExpired(device.Expires, now) {
+		if ok && device.Authorized && (device.KeyExpiryDisabled || !deviceExpired(device.Expires, now)) {
 			return true
 		}
 	}
