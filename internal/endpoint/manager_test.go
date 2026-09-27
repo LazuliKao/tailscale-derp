@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ type fakeMapper struct {
 	err         error
 	fingerprint string
 	publicIP    netip.Addr
+	publicIPv6  netip.Addr
 	calls       int
 }
 
@@ -41,13 +43,28 @@ func (m *fakeMapper) PublicIPv4(string) (netip.Addr, error) {
 	return m.publicIP, nil
 }
 
+func (m *fakeMapper) PublicIPv6(string) (netip.Addr, error) {
+	if !m.publicIPv6.IsValid() {
+		return netip.Addr{}, errors.New("no public IPv6")
+	}
+	return m.publicIPv6, nil
+}
+
 type fakeCertificateUpdater struct {
 	addresses []string
 }
 
-func (c *fakeCertificateUpdater) UpdateEndpointIP(address string) error {
-	c.addresses = append(c.addresses, address)
+func (c *fakeCertificateUpdater) UpdateEndpointIPs(addresses []string) error {
+	c.addresses = append([]string(nil), addresses...)
 	return nil
+}
+
+type familyValidator struct {
+	result ValidationResult
+}
+
+func (v *familyValidator) Validate(context.Context, Endpoint, []string, bool) ValidationResult {
+	return v.result
 }
 
 func (c *fakeCertificateUpdater) ExpectedCertHash() []byte { return nil }
@@ -219,6 +236,93 @@ func TestDirectModePublishesInterfacePublicAddress(t *testing.T) {
 	}
 	if syncer.publishes != 1 {
 		t.Fatalf("publishes = %d, want 1", syncer.publishes)
+	}
+}
+
+func TestDirectIPv6PublishesWithIPv6SAN(t *testing.T) {
+	mapper := &fakeMapper{publicIPv6: netip.MustParseAddr("2001:4860:4860::8888")}
+	certificates := &fakeCertificateUpdater{}
+	manager := NewManager(Config{
+		Enabled: true, Mode: ModeDirect, AddressFamily: FamilyIPv6, TLSConfigured: true,
+	}, mapper, &fakeValidator{}, &fakeSyncer{}, certificates)
+	manager.SetLocalPorts(443, 0)
+
+	if err := manager.Reconcile(context.Background()); err != nil {
+		t.Fatalf("IPv6 reconcile failed: %v", err)
+	}
+	endpoint := manager.Status().Endpoint
+	if endpoint == nil || endpoint.IPv4 != "" || endpoint.IPv6 != "2001:4860:4860::8888" || endpoint.DERPPort != 443 {
+		t.Fatalf("unexpected IPv6 endpoint: %#v", endpoint)
+	}
+	if len(certificates.addresses) != 1 || certificates.addresses[0] != "2001:4860:4860::8888" {
+		t.Fatalf("certificate addresses = %#v", certificates.addresses)
+	}
+}
+
+func TestIPv6IsNotPublishedWhenListenersAreIPv4Only(t *testing.T) {
+	mapper := &fakeMapper{publicIPv6: netip.MustParseAddr("2001:4860:4860::8888")}
+	manager := NewManager(Config{
+		Enabled: true, Mode: ModeDirect, AddressFamily: FamilyIPv6, TLSConfigured: true,
+	}, mapper, &fakeValidator{}, &fakeSyncer{})
+	manager.SetLocalBindings(443, 0, true, false)
+
+	if err := manager.Reconcile(context.Background()); err == nil || !strings.Contains(err.Error(), "not bound for IPv6") {
+		t.Fatalf("IPv6 reconcile error = %v, want listener-family error", err)
+	}
+	if status := manager.Status(); status.Endpoint != nil {
+		t.Fatalf("unexpected endpoint published from IPv4-only listener: %#v", status.Endpoint)
+	}
+}
+
+func TestDualStackKeepsWorkingFamilyAfterValidationFailure(t *testing.T) {
+	mapper := &fakeMapper{
+		publicIP:   netip.MustParseAddr("8.8.8.8"),
+		publicIPv6: netip.MustParseAddr("2001:4860:4860::8888"),
+	}
+	validator := &familyValidator{result: ValidationResult{
+		Scope: "local_reachability", State: "degraded", DERP: true,
+		Error: "IPv6: DERP loopback failed",
+		IPv4:  &FamilyValidation{State: "passed", DERP: true},
+		IPv6:  &FamilyValidation{State: "failed", Error: "DERP loopback failed"},
+	}}
+	manager := NewManager(Config{
+		Enabled: true, Mode: ModeDirect, AddressFamily: FamilyDual, TLSConfigured: true, ValidateEndpoint: true,
+	}, mapper, validator, &fakeSyncer{})
+	manager.SetLocalPorts(443, 0)
+
+	if err := manager.Reconcile(context.Background()); err != nil {
+		t.Fatalf("partial dual-stack reconcile failed: %v", err)
+	}
+	status := manager.Status()
+	if status.State != "degraded" || status.FailureCount != 0 || status.Endpoint == nil || status.Endpoint.IPv4 != "8.8.8.8" || status.Endpoint.IPv6 != "" {
+		t.Fatalf("unexpected partial dual-stack status: %#v", status)
+	}
+}
+
+func TestSyncDropsFailedIPv4MappingFromDualStackEndpoint(t *testing.T) {
+	mapper := &fakeMapper{
+		publicIPv6: netip.MustParseAddr("2001:4860:4860::8888"),
+	}
+	validator := &familyValidator{result: ValidationResult{State: "passed", DERP: true}}
+	manager := NewManager(Config{
+		Enabled: true, Mode: ModeNAT, AddressFamily: FamilyDual, TLSConfigured: true, ValidateEndpoint: true,
+	}, mapper, validator, &fakeSyncer{})
+	manager.SetLocalPorts(443, 0)
+	if err := manager.Reconcile(context.Background()); err != nil {
+		t.Fatalf("initial dual-stack NAT reconcile failed: %v", err)
+	}
+	validator.result = ValidationResult{
+		Scope: "local_reachability", State: "degraded", DERP: true,
+		Error: "IPv4: DERP loopback failed",
+		IPv4:  &FamilyValidation{State: "failed", Error: "DERP loopback failed"},
+		IPv6:  &FamilyValidation{State: "passed", DERP: true},
+	}
+	if err := manager.Sync(context.Background()); err != nil {
+		t.Fatalf("partial dual-stack sync failed: %v", err)
+	}
+	status := manager.Status()
+	if status.Endpoint == nil || status.Endpoint.IPv4 != "" || status.Endpoint.IPv6 == "" || status.Endpoint.Method != ModeDirect || manager.active != nil {
+		t.Fatalf("unexpected endpoint after IPv4 validation failure: %#v", status)
 	}
 }
 

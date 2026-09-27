@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -149,4 +150,67 @@ func publicIPv4(interfaceName string) (netip.Addr, error) {
 		}
 	}
 	return netip.Addr{}, fmt.Errorf("interface %s has no public IPv4 address", interfaceName)
+}
+
+var nonPublicIPv6 = []netip.Prefix{
+	netip.MustParsePrefix("fc00::/7"),
+	netip.MustParsePrefix("2001:db8::/32"),
+}
+
+// IsPublicIPv6 accepts globally routable unicast IPv6 addresses and rejects
+// private and documentation ranges that IsGlobalUnicast otherwise permits.
+func IsPublicIPv6(addr netip.Addr) bool {
+	if !addr.IsValid() || !addr.Is6() || !addr.IsGlobalUnicast() {
+		return false
+	}
+	for _, prefix := range nonPublicIPv6 {
+		if prefix.Contains(addr) {
+			return false
+		}
+	}
+	return true
+}
+
+func publicIPv6(interfaceName string) (netip.Addr, error) {
+	if interfaceName == "" || interfaceName == "auto" {
+		return sourceIPv6()
+	}
+	iface, err := net.InterfaceByName(interfaceName)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	addresses, err := iface.Addrs()
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	candidates := make([]netip.Addr, 0, len(addresses))
+	for _, address := range addresses {
+		prefix, err := netip.ParsePrefix(address.String())
+		if err == nil && IsPublicIPv6(prefix.Addr()) {
+			candidates = append(candidates, prefix.Addr())
+		}
+	}
+	if len(candidates) == 0 {
+		return netip.Addr{}, fmt.Errorf("interface %s has no public IPv6 address", interfaceName)
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Compare(candidates[j]) < 0 })
+	return candidates[0], nil
+}
+
+func sourceIPv6() (netip.Addr, error) {
+	remote := net.UDPAddrFromAddrPort(netip.MustParseAddrPort("[2001:4860:4860::8888]:53"))
+	conn, err := net.DialUDP("udp6", nil, remote)
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("select IPv6 route source: %w", err)
+	}
+	defer conn.Close()
+	local, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		return netip.Addr{}, errors.New("cannot determine local IPv6 address")
+	}
+	addr, ok := netip.AddrFromSlice(local.IP)
+	if !ok || !IsPublicIPv6(addr) {
+		return netip.Addr{}, errors.New("cannot determine a public IPv6 address")
+	}
+	return addr, nil
 }

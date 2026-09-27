@@ -34,7 +34,7 @@ type Manager struct {
 	mu        sync.RWMutex
 	dir       string
 	baseNames []string
-	endpoint  string
+	endpoints []string
 	current   *tls.Certificate
 	certName  string
 	expected  [sha256.Size]byte
@@ -47,10 +47,10 @@ func NewManager(dir string, names []string) (*Manager, error) {
 	}
 	m := &Manager{dir: dir, baseNames: normalizeNames(names)}
 	if certificate, validTo, err := m.loadCurrent(); err == nil && time.Until(validTo) > renewBefore && containsNames(certificate, m.baseNames) {
-		m.setCurrent(certificate, validTo, "")
+		m.setCurrent(certificate, validTo, nil)
 		return m, nil
 	}
-	if err := m.updateLocked(""); err != nil {
+	if err := m.updateLocked(nil); err != nil {
 		return nil, err
 	}
 	return m, nil
@@ -92,30 +92,37 @@ func (m *Manager) ExpectedCertHash() []byte {
 	return append([]byte(nil), m.expected[:]...)
 }
 
-// UpdateEndpointIP refreshes the certificate before an endpoint is validated
-// or published. An empty address removes a previous dynamic IP SAN.
+// UpdateEndpointIP is retained for callers that publish a single address.
 func (m *Manager) UpdateEndpointIP(ip string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	ip = strings.TrimSpace(ip)
-	if ip == m.endpoint && m.current != nil && time.Until(m.validTo) > renewBefore {
-		return nil
+	if strings.TrimSpace(ip) == "" {
+		return m.UpdateEndpointIPs(nil)
 	}
-	return m.updateLocked(ip)
+	return m.UpdateEndpointIPs([]string{ip})
 }
 
-func (m *Manager) updateLocked(endpoint string) error {
-	names := append([]string(nil), m.baseNames...)
-	if endpoint != "" {
-		names = append(names, endpoint)
+// UpdateEndpointIPs refreshes the certificate before endpoints are validated
+// or published. Replacing the complete set prevents one address family from
+// removing the other family's IP SAN.
+func (m *Manager) UpdateEndpointIPs(ips []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ips = normalizeNames(ips)
+	if sameStringSlice(ips, m.endpoints) && m.current != nil && time.Until(m.validTo) > renewBefore {
+		return nil
 	}
+	return m.updateLocked(ips)
+}
+
+func (m *Manager) updateLocked(endpoints []string) error {
+	names := append([]string(nil), m.baseNames...)
+	names = append(names, endpoints...)
 	names = normalizeNames(names)
 	if len(names) == 0 {
 		names = []string{"localhost"}
 	}
 
 	if certificate, validTo, err := m.loadExisting(names); err == nil && time.Until(validTo) > renewBefore {
-		m.setCurrent(certificate, validTo, endpoint)
+		m.setCurrent(certificate, validTo, endpoints)
 		return nil
 	}
 
@@ -126,16 +133,28 @@ func (m *Manager) updateLocked(endpoint string) error {
 	if err := m.persist(certificate); err != nil {
 		return err
 	}
-	m.setCurrent(certificate, validTo, endpoint)
+	m.setCurrent(certificate, validTo, endpoints)
 	return nil
 }
 
-func (m *Manager) setCurrent(certificate *tls.Certificate, validTo time.Time, endpoint string) {
+func (m *Manager) setCurrent(certificate *tls.Certificate, validTo time.Time, endpoints []string) {
 	m.current = certificate
 	m.validTo = validTo
-	m.endpoint = endpoint
+	m.endpoints = append([]string(nil), endpoints...)
 	m.expected = sha256.Sum256(certificate.Certificate[0])
 	m.certName = "sha256-raw:" + hex.EncodeToString(m.expected[:])
+}
+
+func sameStringSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for index := range a {
+		if a[index] != b[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func (m *Manager) loadExisting(names []string) (*tls.Certificate, time.Time, error) {

@@ -145,6 +145,12 @@ func (c *Client) PublicIPv4(interfaceName string) (netip.Addr, error) {
 	return publicIPv4(interfaceName)
 }
 
+// PublicIPv6 returns a globally routable Direct IPv6 address. It does not
+// participate in PCP, NAT-PMP, or UPnP mappings.
+func (c *Client) PublicIPv6(interfaceName string) (netip.Addr, error) {
+	return publicIPv6(interfaceName)
+}
+
 func validateMapping(mapping *Mapping, request Request) error {
 	if mapping == nil || mapping.DERP == nil {
 		return errors.New("DERP TCP mapping is missing")

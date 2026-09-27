@@ -27,10 +27,50 @@ func (v LocalValidator) Validate(ctx context.Context, endpoint Endpoint, names [
 		timeout = 5 * time.Second
 	}
 	result := ValidationResult{
-		Scope: "local_nat_loopback", State: "failed",
+		Scope: "local_reachability", State: "failed",
 		CheckedAt: time.Now().UTC().Format(time.RFC3339),
 		STUN:      !stunEnabled,
 	}
+	var failures []string
+	passed := 0
+	if endpoint.IPv4 != "" {
+		family := v.validateFamily(ctx, endpoint, endpoint.IPv4, "tcp4", "udp4", names, stunEnabled, timeout)
+		result.IPv4 = &family
+		if family.State == "passed" {
+			passed++
+		} else {
+			failures = append(failures, "IPv4: "+family.Error)
+		}
+	}
+	if endpoint.IPv6 != "" {
+		family := v.validateFamily(ctx, endpoint, endpoint.IPv6, "tcp6", "udp6", names, stunEnabled, timeout)
+		result.IPv6 = &family
+		if family.State == "passed" {
+			passed++
+		} else {
+			failures = append(failures, "IPv6: "+family.Error)
+		}
+	}
+	if passed == 0 {
+		result.Error = strings.Join(failures, "; ")
+		if result.Error == "" {
+			result.Error = "no endpoint address is available"
+		}
+		return result
+	}
+	result.DERP = passed > 0
+	result.STUN = !stunEnabled || passed > 0
+	if len(failures) == 0 {
+		result.State = "passed"
+	} else {
+		result.State = "degraded"
+		result.Error = strings.Join(failures, "; ")
+	}
+	return result
+}
+
+func (v LocalValidator) validateFamily(ctx context.Context, endpoint Endpoint, address, tcpNetwork, udpNetwork string, names []string, stunEnabled bool, timeout time.Duration) FamilyValidation {
+	result := FamilyValidation{State: "failed", STUN: !stunEnabled}
 	if len(names) == 0 {
 		result.Error = "a hostname or certificate name is required for TLS validation"
 		return result
@@ -40,7 +80,7 @@ func (v LocalValidator) Validate(ctx context.Context, endpoint Endpoint, names [
 		if v.ExpectedCertHash != nil {
 			expectedHash = v.ExpectedCertHash()
 		}
-		if err := validateDERP(ctx, endpoint, name, timeout, expectedHash); err != nil {
+		if err := validateDERP(ctx, address, endpoint.DERPPort, name, tcpNetwork, timeout, expectedHash); err != nil {
 			result.Error = err.Error()
 			return result
 		}
@@ -51,7 +91,7 @@ func (v LocalValidator) Validate(ctx context.Context, endpoint Endpoint, names [
 			result.Error = "mapped STUN port is unavailable"
 			return result
 		}
-		if err := validateSTUN(ctx, endpoint, timeout); err != nil {
+		if err := validateSTUN(ctx, address, endpoint.STUNPort, udpNetwork, timeout); err != nil {
 			result.Error = err.Error()
 			return result
 		}
@@ -61,29 +101,28 @@ func (v LocalValidator) Validate(ctx context.Context, endpoint Endpoint, names [
 	return result
 }
 
-func validateDERP(ctx context.Context, endpoint Endpoint, serverName string, timeout time.Duration, expectedHash []byte) error {
+func validateDERP(ctx context.Context, address string, port uint16, serverName, network string, timeout time.Duration, expectedHash []byte) error {
 	serverName = strings.TrimSpace(serverName)
 	if serverName == "" {
 		return errors.New("empty TLS server name")
 	}
-	target := net.JoinHostPort(endpoint.IPv4, fmt.Sprint(endpoint.DERPPort))
+	target := net.JoinHostPort(address, fmt.Sprint(port))
 	tlsConfig := &tls.Config{ServerName: serverName, MinVersion: tls.VersionTLS12}
 	if len(expectedHash) > 0 {
 		if len(expectedHash) != 32 {
 			return errors.New("automatic TLS certificate hash is invalid")
 		}
-		// tlsdial pins the leaf while retaining DNS/IP SAN and validity checks.
 		tlsdial.SetConfigExpectedCertHash(tlsConfig, hex.EncodeToString(expectedHash))
 	}
 	transport := &http.Transport{
 		TLSClientConfig: tlsConfig,
-		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{Timeout: timeout}).DialContext(ctx, network, target)
 		},
 	}
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Transport: transport, Timeout: timeout}
-	requestURL := (&url.URL{Scheme: "https", Host: net.JoinHostPort(serverName, fmt.Sprint(endpoint.DERPPort)), Path: "/derp/probe"}).String()
+	requestURL := (&url.URL{Scheme: "https", Host: net.JoinHostPort(serverName, fmt.Sprint(port)), Path: "/derp/probe"}).String()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
 	if err != nil {
 		return err
@@ -99,12 +138,12 @@ func validateDERP(ctx context.Context, endpoint Endpoint, serverName string, tim
 	return nil
 }
 
-func validateSTUN(ctx context.Context, endpoint Endpoint, timeout time.Duration) error {
-	remote, err := net.ResolveUDPAddr("udp4", net.JoinHostPort(endpoint.IPv4, fmt.Sprint(endpoint.STUNPort)))
+func validateSTUN(ctx context.Context, address string, port int, network string, timeout time.Duration) error {
+	remote, err := net.ResolveUDPAddr(network, net.JoinHostPort(address, fmt.Sprint(port)))
 	if err != nil {
 		return err
 	}
-	conn, err := net.DialUDP("udp4", nil, remote)
+	conn, err := net.DialUDP(network, nil, remote)
 	if err != nil {
 		return err
 	}

@@ -155,6 +155,18 @@ func TestPatchDERPMapSetsAndClearsSTUNOnly(t *testing.T) {
 	}
 }
 
+func TestPatchDERPMapPublishesIPv6AndClearsIPv4(t *testing.T) {
+	source := `{"derpMap":{"regions":{"900":{"regionID":900,"nodes":[{"name":"managed","regionID":900,"ipv4":"8.8.8.8","IPv6":"2001:db8::1"}]}}}}`
+	cfg := APIConfig{RegionID: 900, RegionCode: "home", RegionName: "Home", NodeName: "managed", Hostname: "derp.example.com"}
+	updated, changed, err := patchDERPMap(source, cfg, &endpoint.Endpoint{IPv6: "2001:4860:4860::8888", DERPPort: 443, STUNPort: 3478}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed || strings.Contains(updated, `"ipv4"`) || !strings.Contains(updated, `"IPv6":"2001:4860:4860::8888"`) {
+		t.Fatalf("IPv6 endpoint fields were not updated correctly: %s", updated)
+	}
+}
+
 func TestWithdrawDERPMapRemovesOnlyManagedNode(t *testing.T) {
 	source := `{"derpMap":{"Regions":{"900":{"RegionID":900,"Nodes":[{"Name":"managed","RegionID":900},{"Name":"keep","RegionID":900}]}}}}`
 	cfg := APIConfig{RegionID: 900, NodeName: "managed"}

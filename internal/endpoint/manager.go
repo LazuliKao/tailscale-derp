@@ -18,11 +18,15 @@ const failureThreshold = 3
 const (
 	ModeNAT    = "nat"
 	ModeDirect = "direct"
+	FamilyIPv4 = "ipv4"
+	FamilyIPv6 = "ipv6"
+	FamilyDual = "dual"
 )
 
 type Config struct {
 	Enabled          bool
 	Mode             string
+	AddressFamily    string
 	Methods          []string
 	WANInterface     string
 	DERPPort         string
@@ -37,20 +41,30 @@ type Config struct {
 }
 
 type Endpoint struct {
-	IPv4       string `json:"ipv4"`
+	IPv4       string `json:"ipv4,omitempty"`
+	IPv6       string `json:"ipv6,omitempty"`
 	DERPPort   uint16 `json:"derpPort"`
 	STUNPort   int    `json:"stunPort"`
 	Method     string `json:"method"`
 	LeaseUntil string `json:"leaseUntil,omitempty"`
 }
 
+type FamilyValidation struct {
+	State string `json:"state"`
+	DERP  bool   `json:"derp"`
+	STUN  bool   `json:"stun"`
+	Error string `json:"error,omitempty"`
+}
+
 type ValidationResult struct {
-	Scope     string `json:"scope"`
-	State     string `json:"state"`
-	DERP      bool   `json:"derp"`
-	STUN      bool   `json:"stun"`
-	CheckedAt string `json:"checkedAt,omitempty"`
-	Error     string `json:"error,omitempty"`
+	Scope     string            `json:"scope"`
+	State     string            `json:"state"`
+	DERP      bool              `json:"derp"`
+	STUN      bool              `json:"stun"`
+	CheckedAt string            `json:"checkedAt,omitempty"`
+	Error     string            `json:"error,omitempty"`
+	IPv4      *FamilyValidation `json:"ipv4,omitempty"`
+	IPv6      *FamilyValidation `json:"ipv6,omitempty"`
 }
 
 type InstanceStatus struct {
@@ -90,6 +104,10 @@ type publicIPDiscoverer interface {
 	PublicIPv4(string) (netip.Addr, error)
 }
 
+type publicIPv6Discoverer interface {
+	PublicIPv6(string) (netip.Addr, error)
+}
+
 type Validator interface {
 	Validate(context.Context, Endpoint, []string, bool) ValidationResult
 }
@@ -102,7 +120,7 @@ type Syncer interface {
 // CertificateUpdater refreshes automatic certificate SANs before an endpoint
 // is checked or published.
 type CertificateUpdater interface {
-	UpdateEndpointIP(string) error
+	UpdateEndpointIPs([]string) error
 	ExpectedCertHash() []byte
 }
 
@@ -120,6 +138,8 @@ type Manager struct {
 	wake          chan struct{}
 	localDERPPort uint16
 	localSTUNPort uint16
+	supportsIPv4  bool
+	supportsIPv6  bool
 	active        *portmap.Mapping
 	endpoint      *Endpoint
 	nextRenew     time.Time
@@ -142,6 +162,9 @@ func NewManager(cfg Config, mapper Mapper, validator Validator, syncer Syncer, c
 	if cfg.Mode == "" {
 		cfg.Mode = ModeNAT
 	}
+	if cfg.AddressFamily == "" {
+		cfg.AddressFamily = FamilyIPv4
+	}
 	var certificate CertificateUpdater
 	if len(certificates) > 0 {
 		certificate = certificates[0]
@@ -152,7 +175,7 @@ func NewManager(cfg Config, mapper Mapper, validator Validator, syncer Syncer, c
 	}
 	return &Manager{
 		cfg: cfg, mapper: mapper, validator: validator, syncer: syncer, cert: certificate,
-		wake: make(chan struct{}, 1),
+		wake: make(chan struct{}, 1), supportsIPv4: true, supportsIPv6: true,
 		status: Status{
 			Enabled: cfg.Enabled, State: state,
 			ValidationEnabled: cfg.ValidateEndpoint,
@@ -163,9 +186,17 @@ func NewManager(cfg Config, mapper Mapper, validator Validator, syncer Syncer, c
 }
 
 func (m *Manager) SetLocalPorts(derpPort, stunPort uint16) {
+	m.SetLocalBindings(derpPort, stunPort, true, true)
+}
+
+// SetLocalBindings records the listener ports and families that were actually
+// bound so an IPv4-only wildcard can never publish an IPv6 endpoint.
+func (m *Manager) SetLocalBindings(derpPort, stunPort uint16, ipv4, ipv6 bool) {
 	m.mu.Lock()
 	m.localDERPPort = derpPort
 	m.localSTUNPort = stunPort
+	m.supportsIPv4 = ipv4
+	m.supportsIPv6 = ipv6
 	m.status.LocalDERPPort = derpPort
 	m.status.LocalSTUNPort = stunPort
 	m.mu.Unlock()
@@ -203,7 +234,7 @@ func (m *Manager) loop(ctx context.Context) {
 
 func (m *Manager) maintain(ctx context.Context) {
 	m.mu.RLock()
-	active := m.active != nil || (m.cfg.Mode == ModeDirect && m.endpoint != nil)
+	active := m.endpoint != nil
 	nextRenew := m.nextRenew
 	nextSync := m.nextSync
 	network := m.network
@@ -213,7 +244,7 @@ func (m *Manager) maintain(ctx context.Context) {
 	if localDERP == 0 || (m.cfg.STUNEnabled && localSTUN == 0) {
 		return
 	}
-	if active && m.cfg.Mode == ModeNAT {
+	if active && m.cfg.Mode == ModeNAT && m.wantsIPv4() {
 		if fingerprinter, ok := m.mapper.(networkFingerprinter); ok {
 			current, err := fingerprinter.NetworkFingerprint(m.cfg.WANInterface)
 			if err != nil {
@@ -252,14 +283,22 @@ func (m *Manager) Check(ctx context.Context) error {
 	m.mu.Lock()
 	m.status.Validation = result
 	m.mu.Unlock()
-	if result.State != "passed" {
+	if result.State == "failed" {
 		err := errors.New(result.Error)
 		if m.cfg.ValidateEndpoint {
 			return m.fail(ctx, err)
 		}
 		return err
 	}
-	m.resetValidationFailures()
+	if result.State == "degraded" {
+		current, err := m.applyPartialValidation(ctx, current, result)
+		if err != nil {
+			return err
+		}
+		m.resetValidationFailures(false)
+		return m.publish(ctx, *current)
+	}
+	m.resetValidationFailures(true)
 	return nil
 }
 
@@ -277,10 +316,19 @@ func (m *Manager) Sync(ctx context.Context) error {
 		m.mu.Lock()
 		m.status.Validation = result
 		m.mu.Unlock()
-		if result.State != "passed" {
+		if result.State == "failed" {
 			return m.fail(ctx, errors.New(result.Error))
 		}
-		m.resetValidationFailures()
+		if result.State == "degraded" {
+			var err error
+			current, err = m.applyPartialValidation(ctx, current, result)
+			if err != nil {
+				return err
+			}
+			m.resetValidationFailures(false)
+		} else {
+			m.resetValidationFailures(true)
+		}
 	}
 	return m.publish(ctx, *current)
 }
@@ -294,52 +342,96 @@ func (m *Manager) reconcile(ctx context.Context, forceValidation bool) error {
 	m.mu.RLock()
 	localDERP := m.localDERPPort
 	localSTUN := m.localSTUNPort
+	supportsIPv4 := m.supportsIPv4
+	supportsIPv6 := m.supportsIPv6
 	m.mu.RUnlock()
 	if localDERP == 0 || (m.cfg.STUNEnabled && localSTUN == 0) {
 		return m.fail(ctx, errors.New("DERP/STUN listeners are not ready"))
 	}
 	m.setAttempt("mapping")
 	var mapping *portmap.Mapping
-	var candidate Endpoint
-	if m.cfg.Mode == ModeDirect {
-		discoverer, ok := m.mapper.(publicIPDiscoverer)
+	candidate := Endpoint{DERPPort: localDERP, STUNPort: -1, Method: ModeDirect}
+	if m.cfg.STUNEnabled {
+		candidate.STUNPort = int(localSTUN)
+	}
+	var problems []error
+	if m.wantsIPv4() && !supportsIPv4 {
+		problems = append(problems, errors.New("DERP/STUN listeners are not bound for IPv4"))
+	} else if m.wantsIPv4() {
+		if m.cfg.Mode == ModeDirect {
+			discoverer, ok := m.mapper.(publicIPDiscoverer)
+			if !ok {
+				problems = append(problems, errors.New("public IPv4 discovery is unavailable"))
+			} else if address, err := discoverer.PublicIPv4(m.cfg.WANInterface); err != nil {
+				problems = append(problems, fmt.Errorf("discover public IPv4: %w", err))
+			} else {
+				candidate.IPv4 = address.String()
+			}
+		} else {
+			request, err := m.mappingRequest(localDERP, localSTUN)
+			if err != nil {
+				problems = append(problems, err)
+			} else if mapping, err = m.mapper.Map(ctx, request); err != nil {
+				problems = append(problems, err)
+			} else {
+				candidate.IPv4 = mapping.DERP.ExternalIP.String()
+				candidate.DERPPort = mapping.DERP.ExternalPort
+				candidate.STUNPort = -1
+				if mapping.STUN != nil {
+					candidate.STUNPort = int(mapping.STUN.ExternalPort)
+				}
+				candidate.Method = mapping.Method
+				candidate.LeaseUntil = mapping.ExpiresAt().UTC().Format(time.RFC3339)
+			}
+		}
+	}
+	if m.wantsIPv6() && !supportsIPv6 {
+		problems = append(problems, errors.New("DERP/STUN listeners are not bound for IPv6"))
+	} else if m.wantsIPv6() {
+		discoverer, ok := m.mapper.(publicIPv6Discoverer)
 		if !ok {
-			return m.fail(ctx, errors.New("public IPv4 discovery is unavailable"))
+			problems = append(problems, errors.New("public IPv6 discovery is unavailable"))
+		} else if address, err := discoverer.PublicIPv6(m.cfg.WANInterface); err != nil {
+			problems = append(problems, fmt.Errorf("discover public IPv6: %w", err))
+		} else {
+			candidate.IPv6 = address.String()
 		}
-		address, err := discoverer.PublicIPv4(m.cfg.WANInterface)
-		if err != nil {
-			return m.fail(ctx, fmt.Errorf("discover public IPv4: %w", err))
-		}
-		candidate = Endpoint{IPv4: address.String(), DERPPort: localDERP, STUNPort: -1, Method: ModeDirect}
+	}
+	// A DERP map node has one port set. Do not advertise Direct IPv6 through a
+	// different IPv4 NAT-assigned port.
+	if candidate.IPv4 != "" && candidate.IPv6 != "" && mapping != nil &&
+		(candidate.DERPPort != localDERP || (m.cfg.STUNEnabled && candidate.STUNPort != int(localSTUN))) {
+		_ = mapping.Release(context.Background())
+		mapping = nil
+		candidate.IPv4 = ""
+		candidate.DERPPort = localDERP
+		candidate.STUNPort = -1
 		if m.cfg.STUNEnabled {
 			candidate.STUNPort = int(localSTUN)
 		}
-	} else {
-		request, err := m.mappingRequest(localDERP, localSTUN)
-		if err != nil {
-			return m.fail(ctx, err)
-		}
-		mapping, err = m.mapper.Map(ctx, request)
-		if err != nil {
-			return m.fail(ctx, err)
-		}
-		candidate = Endpoint{IPv4: mapping.DERP.ExternalIP.String(), DERPPort: mapping.DERP.ExternalPort, STUNPort: -1, Method: mapping.Method, LeaseUntil: mapping.ExpiresAt().UTC().Format(time.RFC3339)}
-		if mapping.STUN != nil {
-			candidate.STUNPort = int(mapping.STUN.ExternalPort)
-		}
+		candidate.Method = ModeDirect
+		candidate.LeaseUntil = ""
+		problems = append(problems, errors.New("IPv4 NAT mapping did not preserve the local port required for dual-stack publishing"))
+	}
+	if candidate.IPv4 == "" && candidate.IPv6 == "" {
+		_ = mapping.Release(context.Background())
+		return m.fail(ctx, errors.Join(problems...))
+	}
+	if candidate.IPv4 != "" && candidate.IPv6 != "" && mapping != nil {
+		candidate.Method = "nat+direct"
 	}
 	if !m.cfg.TLSConfigured {
 		_ = mapping.Release(context.Background())
 		return m.fail(ctx, errors.New("TLS certificate and key are required before publishing a DERP endpoint"))
 	}
 	if m.cert != nil {
-		if err := m.cert.UpdateEndpointIP(candidate.IPv4); err != nil {
+		if err := m.cert.UpdateEndpointIPs(candidate.addresses()); err != nil {
 			_ = mapping.Release(context.Background())
 			return m.fail(ctx, fmt.Errorf("refresh automatic TLS certificate: %w", err))
 		}
 	}
 	network := ""
-	if m.cfg.Mode == ModeNAT {
+	if m.cfg.Mode == ModeNAT && candidate.IPv4 != "" {
 		if fingerprinter, ok := m.mapper.(networkFingerprinter); ok {
 			var err error
 			network, err = fingerprinter.NetworkFingerprint(m.cfg.WANInterface)
@@ -355,9 +447,31 @@ func (m *Manager) reconcile(ctx context.Context, forceValidation bool) error {
 		m.mu.Lock()
 		m.status.Validation = result
 		m.mu.Unlock()
-		if result.State != "passed" {
+		candidate = candidate.validated(result)
+		if candidate.IPv4 == "" && candidate.IPv6 == "" {
 			_ = mapping.Release(context.Background())
 			return m.fail(ctx, errors.New(result.Error))
+		}
+		if result.State != "passed" && result.Error != "" {
+			problems = append(problems, errors.New(result.Error))
+		}
+		if candidate.IPv4 == "" && mapping != nil {
+			_ = mapping.Release(context.Background())
+			mapping = nil
+			candidate.DERPPort = localDERP
+			candidate.STUNPort = -1
+			if m.cfg.STUNEnabled {
+				candidate.STUNPort = int(localSTUN)
+			}
+			candidate.Method = ModeDirect
+			candidate.LeaseUntil = ""
+			network = ""
+		}
+		if m.cert != nil {
+			if err := m.cert.UpdateEndpointIPs(candidate.addresses()); err != nil {
+				_ = mapping.Release(context.Background())
+				return m.fail(ctx, fmt.Errorf("refresh automatic TLS certificate: %w", err))
+			}
 		}
 	} else {
 		m.mu.Lock()
@@ -379,7 +493,13 @@ func (m *Manager) reconcile(ctx context.Context, forceValidation bool) error {
 	m.status.Endpoint = cloneEndpoint(&candidate)
 	m.status.FailureCount = 0
 	m.status.Error = ""
+	if problem := errors.Join(problems...); problem != nil {
+		m.status.Error = problem.Error()
+	}
 	m.status.State = "ready"
+	if len(problems) > 0 || (m.cfg.ValidateEndpoint && m.status.Validation.State != "passed") {
+		m.status.State = "degraded"
+	}
 	m.status.LastSuccess = time.Now().UTC().Format(time.RFC3339)
 	m.mu.Unlock()
 	if old != nil && (oldNetwork != network || !sameMapping(old, mapping)) {
@@ -404,8 +524,44 @@ func (m *Manager) publish(ctx context.Context, value Endpoint) error {
 	if err != nil {
 		return err
 	}
-	m.setState("ready", "")
 	return nil
+}
+
+func (m *Manager) applyPartialValidation(ctx context.Context, current *Endpoint, result ValidationResult) (*Endpoint, error) {
+	pruned := current.validated(result)
+	if pruned.IPv4 == "" && pruned.IPv6 == "" {
+		return nil, m.fail(ctx, errors.New(result.Error))
+	}
+	if m.cert != nil {
+		if err := m.cert.UpdateEndpointIPs(pruned.addresses()); err != nil {
+			return nil, m.fail(ctx, fmt.Errorf("refresh automatic TLS certificate: %w", err))
+		}
+	}
+
+	var release *portmap.Mapping
+	m.mu.Lock()
+	if current.IPv4 != "" && pruned.IPv4 == "" {
+		release = m.active
+		m.active = nil
+		m.network = ""
+		m.nextRenew = time.Now().Add(m.cfg.RetryInterval)
+		pruned.DERPPort = m.localDERPPort
+		pruned.STUNPort = -1
+		if m.cfg.STUNEnabled {
+			pruned.STUNPort = int(m.localSTUNPort)
+		}
+		pruned.Method = ModeDirect
+		pruned.LeaseUntil = ""
+	}
+	m.endpoint = &pruned
+	m.status.Endpoint = cloneEndpoint(&pruned)
+	m.status.State = "degraded"
+	m.status.Error = result.Error
+	m.mu.Unlock()
+	if release != nil {
+		_ = release.Release(context.Background())
+	}
+	return &pruned, nil
 }
 
 func (m *Manager) fail(ctx context.Context, err error) error {
@@ -443,12 +599,12 @@ func (m *Manager) fail(ctx context.Context, err error) error {
 	return errors.Join(err, withdrawErr)
 }
 
-func (m *Manager) resetValidationFailures() {
+func (m *Manager) resetValidationFailures(markReady bool) {
 	m.mu.Lock()
 	hadFailures := m.status.FailureCount > 0
 	m.status.FailureCount = 0
 	m.withdrawRetry = false
-	if hadFailures {
+	if hadFailures && markReady {
 		m.status.Error = ""
 		if m.endpoint != nil {
 			m.status.State = "ready"
@@ -474,6 +630,40 @@ func (m *Manager) mappingRequest(localDERP, localSTUN uint16) (portmap.Request, 
 		request.STUN = &portmap.PortRequest{Protocol: portmap.UDP, InternalPort: localSTUN, ExternalPort: stunExternal, Strict: stunStrict}
 	}
 	return request, nil
+}
+
+func (m *Manager) wantsIPv4() bool {
+	return m.cfg.AddressFamily == FamilyIPv4 || m.cfg.AddressFamily == FamilyDual
+}
+
+func (m *Manager) wantsIPv6() bool {
+	return m.cfg.AddressFamily == FamilyIPv6 || m.cfg.AddressFamily == FamilyDual
+}
+
+func (e Endpoint) addresses() []string {
+	addresses := make([]string, 0, 2)
+	if e.IPv4 != "" {
+		addresses = append(addresses, e.IPv4)
+	}
+	if e.IPv6 != "" {
+		addresses = append(addresses, e.IPv6)
+	}
+	return addresses
+}
+
+func (e Endpoint) validated(result ValidationResult) Endpoint {
+	if result.IPv4 != nil && result.IPv4.State != "passed" {
+		e.IPv4 = ""
+	}
+	if result.IPv6 != nil && result.IPv6.State != "passed" {
+		e.IPv6 = ""
+	}
+	// Older validator implementations only return the aggregate result.
+	if result.IPv4 == nil && result.IPv6 == nil && result.State != "passed" {
+		e.IPv4 = ""
+		e.IPv6 = ""
+	}
+	return e
 }
 
 func requestedPort(value string, local uint16) (uint16, bool, error) {

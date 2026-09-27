@@ -52,3 +52,40 @@ func TestManagerPersistsSANsAndHash(t *testing.T) {
 		t.Fatal("changed SANs should issue a new certificate")
 	}
 }
+
+func TestManagerUpdatesTheCompleteEndpointSet(t *testing.T) {
+	manager, err := NewManager(t.TempDir(), []string{"derp.example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.UpdateEndpointIPs([]string{"2001:4860:4860::8888", "8.8.8.8"}); err != nil {
+		t.Fatal(err)
+	}
+	certificate, err := manager.GetCertificate(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, err := x509.ParseCertificate(certificate.Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, address := range []string{"8.8.8.8", "2001:4860:4860::8888"} {
+		if err := leaf.VerifyHostname(address); err != nil {
+			t.Fatalf("certificate does not cover %s: %v", address, err)
+		}
+	}
+	if err := manager.UpdateEndpointIPs([]string{"8.8.8.8"}); err != nil {
+		t.Fatal(err)
+	}
+	certificate, err = manager.GetCertificate(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, err = x509.ParseCertificate(certificate.Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := leaf.VerifyHostname("2001:4860:4860::8888"); err == nil {
+		t.Fatal("pruned IPv6 address remains in certificate")
+	}
+}

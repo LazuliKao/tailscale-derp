@@ -207,7 +207,16 @@ func patchDERPMap(source string, cfg APIConfig, value *endpoint.Endpoint, withdr
 	setObjectString(node, "name", cfg.NodeName)
 	setObjectInt(node, "regionID", cfg.RegionID)
 	setObjectString(node, "hostName", cfg.Hostname)
-	setObjectString(node, "ipv4", value.IPv4)
+	if value.IPv4 == "" {
+		removeObjectMember(node, "ipv4")
+	} else {
+		setObjectString(node, "ipv4", value.IPv4)
+	}
+	if value.IPv6 == "" {
+		removeObjectMember(node, "ipv6")
+	} else {
+		setObjectString(node, "ipv6", value.IPv6)
+	}
 	setObjectInt(node, "derpPort", int(value.DERPPort))
 	setObjectInt(node, "stunPort", value.STUNPort)
 	if cfg.CertName == "" {

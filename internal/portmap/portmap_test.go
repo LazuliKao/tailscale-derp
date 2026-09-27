@@ -29,6 +29,26 @@ func TestIsPublicIPv4(t *testing.T) {
 	}
 }
 
+func TestIsPublicIPv6(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		address string
+		want    bool
+	}{
+		{"2001:4860:4860::8888", true},
+		{"::", false},
+		{"::1", false},
+		{"fe80::1", false},
+		{"fc00::1", false},
+		{"2001:db8::1", false},
+		{"8.8.8.8", false},
+	} {
+		if got := IsPublicIPv6(netip.MustParseAddr(test.address)); got != test.want {
+			t.Errorf("IsPublicIPv6(%q) = %v, want %v", test.address, got, test.want)
+		}
+	}
+}
+
 type backendFunc func(context.Context, Request) (*Mapping, error)
 
 func (fn backendFunc) Map(ctx context.Context, request Request) (*Mapping, error) {

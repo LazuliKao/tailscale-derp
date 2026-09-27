@@ -12,6 +12,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -182,15 +183,20 @@ func defaultConfigPath() string {
 }
 
 func validateOptionalPortBinding(name, value string) error {
-	if !strings.HasPrefix(value, ":") {
+	if value == "" {
 		return nil
 	}
-
-	port, _ := strings.CutPrefix(value, ":")
-	if _, err := strconv.Atoi(port); err != nil {
-		return fmt.Errorf("%s must use a valid port", name)
+	if strings.TrimSpace(value) != value {
+		return fmt.Errorf("%s must use a valid host:port address", name)
 	}
-
+	_, port, err := net.SplitHostPort(value)
+	if err != nil {
+		return fmt.Errorf("%s must use a valid host:port address: %w", name, err)
+	}
+	parsed, err := strconv.ParseUint(port, 10, 16)
+	if err != nil || parsed == 0 {
+		return fmt.Errorf("%s must use a port from 1 to 65535", name)
+	}
 	return nil
 }
 
@@ -320,6 +326,7 @@ func buildConfig(args []string, openFile func(string) (*uciConfig, error)) (*Con
 		},
 		External: endpoint.Config{
 			Mode:          endpoint.ModeNAT,
+			AddressFamily: endpoint.FamilyIPv4,
 			Methods:       []string{"pcp", "natpmp", "upnp"},
 			WANInterface:  "auto",
 			DERPPort:      "auto",
@@ -443,6 +450,9 @@ func applyUCIConfig(cfg *Config, parsed *uciConfig) error {
 	}
 	if value, ok := parsed.first("external", "mode"); ok && strings.TrimSpace(value) != "" {
 		cfg.External.Mode = strings.ToLower(strings.TrimSpace(value))
+	}
+	if value, ok := parsed.first("external", "address_family"); ok && strings.TrimSpace(value) != "" {
+		cfg.External.AddressFamily = strings.ToLower(strings.TrimSpace(value))
 	}
 	if methods := parsed.get("external", "method"); len(methods) > 0 {
 		cfg.External.Methods = nil
@@ -763,6 +773,9 @@ func validateConfig(cfg *Config) error {
 	if cfg.External.Mode == "" {
 		cfg.External.Mode = endpoint.ModeNAT
 	}
+	if cfg.External.AddressFamily == "" {
+		cfg.External.AddressFamily = endpoint.FamilyIPv4
+	}
 	if cfg.External.WANInterface == "" {
 		cfg.External.WANInterface = "auto"
 	}
@@ -803,7 +816,10 @@ func validateConfig(cfg *Config) error {
 	if cfg.External.Mode != endpoint.ModeNAT && cfg.External.Mode != endpoint.ModeDirect {
 		return fmt.Errorf("external.mode must be direct or nat")
 	}
-	if cfg.External.Enabled && cfg.External.Mode == endpoint.ModeNAT && len(cfg.External.Methods) == 0 {
+	if cfg.External.AddressFamily != endpoint.FamilyIPv4 && cfg.External.AddressFamily != endpoint.FamilyIPv6 && cfg.External.AddressFamily != endpoint.FamilyDual {
+		return fmt.Errorf("external.address_family must be ipv4, ipv6, or dual")
+	}
+	if cfg.External.Enabled && (cfg.External.AddressFamily == endpoint.FamilyIPv4 || cfg.External.AddressFamily == endpoint.FamilyDual) && cfg.External.Mode == endpoint.ModeNAT && len(cfg.External.Methods) == 0 {
 		return fmt.Errorf("external requires at least one mapping method")
 	}
 	for _, method := range cfg.External.Methods {
@@ -913,12 +929,14 @@ func startDERP(ctx context.Context, cfg *Config, state *runtimeState, persister 
 		return err
 	}
 	var stunPort uint16
+	var stunAddress net.Addr
 	if cfg.STUN {
 		stun := stunserver.New(ctx)
 		if err := stun.Listen(cfg.Listen); err != nil {
 			return fmt.Errorf("listen for STUN: %w", err)
 		}
-		stunPort, err = addressPort(stun.LocalAddr())
+		stunAddress = stun.LocalAddr()
+		stunPort, err = addressPort(stunAddress)
 		if err != nil {
 			return err
 		}
@@ -929,7 +947,12 @@ func startDERP(ctx context.Context, cfg *Config, state *runtimeState, persister 
 		}()
 	}
 	if external != nil {
-		external.SetLocalPorts(derpPort, stunPort)
+		derpIPv4, derpIPv6 := listenerFamilies(listener.Addr())
+		stunIPv4, stunIPv6 := true, true
+		if cfg.STUN {
+			stunIPv4, stunIPv6 = listenerFamilies(stunAddress)
+		}
+		external.SetLocalBindings(derpPort, stunPort, derpIPv4 && stunIPv4, derpIPv6 && stunIPv6)
 	}
 
 	mux := http.NewServeMux()
@@ -1002,6 +1025,41 @@ func addressPort(address net.Addr) (uint16, error) {
 		return 0, fmt.Errorf("listener returned invalid port %q", rawPort)
 	}
 	return uint16(port), nil
+}
+
+func listenerFamilies(address net.Addr) (bool, bool) {
+	var ip net.IP
+	switch value := address.(type) {
+	case *net.TCPAddr:
+		ip = value.IP
+	case *net.UDPAddr:
+		ip = value.IP
+	default:
+		return true, true
+	}
+	if len(ip) == 0 {
+		return true, true
+	}
+	parsed, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return true, true
+	}
+	parsed = parsed.Unmap()
+	if parsed.Is4() {
+		return true, false
+	}
+	if parsed.IsUnspecified() {
+		return ipv6WildcardSupportsIPv4(), true
+	}
+	return false, true
+}
+
+func ipv6WildcardSupportsIPv4() bool {
+	raw, err := os.ReadFile("/proc/sys/net/ipv6/bindv6only")
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(raw)) == "0"
 }
 
 func publishDERPMetrics(server *derpserver.Server) expvar.Var {

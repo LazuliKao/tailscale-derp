@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -50,6 +51,9 @@ func TestBuildConfig_DefaultsWithoutUCI(t *testing.T) {
 	if cfg.External.DERPPort != "auto" || cfg.External.STUNPort != "auto" {
 		t.Fatalf("expected automatic external ports, got DERP=%q STUN=%q", cfg.External.DERPPort, cfg.External.STUNPort)
 	}
+	if cfg.External.AddressFamily != endpoint.FamilyIPv4 {
+		t.Fatalf("expected IPv4 external default, got %q", cfg.External.AddressFamily)
+	}
 	if cfg.External.LeaseDuration != 2*time.Hour || cfg.External.RetryInterval != time.Minute || cfg.External.SyncInterval != 5*time.Minute {
 		t.Fatalf("unexpected external timing defaults: %+v", cfg.External)
 	}
@@ -64,6 +68,7 @@ func TestBuildConfig_AppliesExternalAndDERPMapSync(t *testing.T) {
 
 config external 'external'
 	option enabled '1'
+	option address_family 'dual'
 	list method 'upnp'
 	list method 'natpmp'
 	option wan_interface 'wan'
@@ -97,6 +102,9 @@ config verify_api 'primary'
 	}
 	if !cfg.External.Enabled || !cfg.External.ValidateEndpoint || !cfg.External.TLSConfigured {
 		t.Fatalf("unexpected external flags: %+v", cfg.External)
+	}
+	if cfg.External.AddressFamily != endpoint.FamilyDual {
+		t.Fatalf("unexpected address family: %q", cfg.External.AddressFamily)
 	}
 	if strings.Join(cfg.External.Methods, ",") != "upnp,natpmp" || cfg.External.WANInterface != "wan" {
 		t.Fatalf("unexpected external discovery config: %+v", cfg.External)
@@ -449,6 +457,58 @@ func TestValidateConfig_ExternalEndpoint(t *testing.T) {
 			err := validateConfig(cfg)
 			if err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("validateConfig() error = %v, want substring %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestValidateConfig_ExternalAddressFamilies(t *testing.T) {
+	valid := func() *Config {
+		return &Config{
+			Listen: ":3478", CertFile: "/path/to/cert.pem", KeyFile: "/path/to/key.pem",
+			External: endpoint.Config{Enabled: true, Mode: endpoint.ModeNAT, AddressFamily: endpoint.FamilyIPv6, DERPPort: "auto", STUNPort: "auto", TLSConfigured: true},
+		}
+	}
+	if err := validateConfig(valid()); err != nil {
+		t.Fatalf("IPv6 external endpoint should not require NAT methods: %v", err)
+	}
+	invalid := valid()
+	invalid.External.AddressFamily = "ipv5"
+	if err := validateConfig(invalid); err == nil || !strings.Contains(err.Error(), "address_family") {
+		t.Fatalf("invalid address family error = %v", err)
+	}
+}
+
+func TestValidateOptionalPortBinding(t *testing.T) {
+	for _, value := range []string{":3478", "127.0.0.1:3478", "[::]:3478", "[2001:db8::1]:443"} {
+		if err := validateOptionalPortBinding("listen", value); err != nil {
+			t.Errorf("validateOptionalPortBinding(%q) = %v", value, err)
+		}
+	}
+	for _, value := range []string{"3478", "[::]:0", "[::]:70000", "2001:db8::1:3478", ":abc"} {
+		if err := validateOptionalPortBinding("listen", value); err == nil {
+			t.Errorf("validateOptionalPortBinding(%q) unexpectedly succeeded", value)
+		}
+	}
+}
+
+func TestListenerFamilies(t *testing.T) {
+	tests := []struct {
+		name     string
+		address  net.Addr
+		wantIPv4 bool
+		wantIPv6 bool
+	}{
+		{name: "TCP IPv4", address: &net.TCPAddr{IP: net.ParseIP("192.0.2.1")}, wantIPv4: true},
+		{name: "UDP IPv4 wildcard", address: &net.UDPAddr{IP: net.IPv4zero}, wantIPv4: true},
+		{name: "TCP IPv6", address: &net.TCPAddr{IP: net.ParseIP("2001:db8::1")}, wantIPv6: true},
+		{name: "unknown address", address: &net.UnixAddr{Name: "/tmp/derp", Net: "unix"}, wantIPv4: true, wantIPv6: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ipv4, ipv6 := listenerFamilies(test.address)
+			if ipv4 != test.wantIPv4 || ipv6 != test.wantIPv6 {
+				t.Fatalf("listenerFamilies(%v) = (%v, %v), want (%v, %v)", test.address, ipv4, ipv6, test.wantIPv4, test.wantIPv6)
 			}
 		})
 	}
