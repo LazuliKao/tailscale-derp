@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -125,6 +124,7 @@ type configFlags struct {
 	TrafficPath     *string
 	TrafficInterval *int
 	ConfigPath      *string
+	SchemaPath      *string
 }
 
 type uciSection struct {
@@ -164,7 +164,8 @@ func newFlagSet(args []string) (*flag.FlagSet, *configFlags, error) {
 		TrafficPersist:  fs.Bool("traffic-persist", false, "enable traffic statistics persistence"),
 		TrafficPath:     fs.String("traffic-path", "", "path to traffic statistics file"),
 		TrafficInterval: fs.Int("traffic-interval", 0, "traffic save interval in seconds"),
-		ConfigPath:      fs.String("config", defaultConfigPath(), "UCI config path"),
+		ConfigPath:      fs.String("config", defaultConfigPath(), "configuration file path; format is inferred from its extension"),
+		SchemaPath:      fs.String("generate-config-schema", "", "write the JSON configuration schema to this path (requires the schema build tag)"),
 	}
 
 	if err := fs.Parse(args); err != nil {
@@ -179,7 +180,7 @@ func defaultConfigPath() string {
 		return path
 	}
 
-	return "/etc/config/tailscale-derp"
+	return defaultConfigFilePath()
 }
 
 func validateOptionalPortBinding(name, value string) error {
@@ -209,85 +210,6 @@ func parseBoolValue(value string) (bool, error) {
 	default:
 		return false, fmt.Errorf("invalid boolean value %q", value)
 	}
-}
-
-func parseUCIConfig(path string) (*uciConfig, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	parsed := &uciConfig{values: make(map[string]map[string][]string)}
-	scanner := bufio.NewScanner(file)
-	currentSection := ""
-	currentType := ""
-
-	for lineNum := 1; scanner.Scan(); lineNum++ {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		fields := strings.Fields(line)
-		if len(fields) == 0 {
-			continue
-		}
-
-		switch fields[0] {
-		case "config":
-			if len(fields) < 2 {
-				return nil, fmt.Errorf("invalid config declaration on line %d", lineNum)
-			}
-			currentType = trimQuotes(fields[1])
-			currentSection = ""
-			if len(fields) >= 3 {
-				currentSection = trimQuotes(fields[2])
-			}
-			if currentSection == "" {
-				for index := 1; ; index++ {
-					candidate := fmt.Sprintf("%s_%d", currentType, index)
-					if _, exists := parsed.values[candidate]; !exists {
-						currentSection = candidate
-						break
-					}
-				}
-			}
-			sectionValues := make(map[string][]string)
-			parsed.values[currentSection] = sectionValues
-			parsed.sections = append(parsed.sections, uciSection{
-				typ:    currentType,
-				name:   currentSection,
-				values: sectionValues,
-			})
-		case "option":
-			if currentSection == "" || len(fields) < 3 {
-				return nil, fmt.Errorf("invalid option declaration on line %d", lineNum)
-			}
-			key := trimQuotes(fields[1])
-			value := trimQuotes(strings.Join(fields[2:], " "))
-			parsed.values[currentSection][key] = []string{value}
-		case "list":
-			if currentSection == "" || len(fields) < 3 {
-				return nil, fmt.Errorf("invalid list declaration on line %d", lineNum)
-			}
-			key := trimQuotes(fields[1])
-			value := trimQuotes(strings.Join(fields[2:], " "))
-			parsed.values[currentSection][key] = append(parsed.values[currentSection][key], value)
-		default:
-			return nil, fmt.Errorf("unsupported directive %q on line %d", fields[0], lineNum)
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-
-	return parsed, nil
-}
-
-func trimQuotes(value string) string {
-	return strings.Trim(value, "'\"")
 }
 
 func boolFlagProvided(fs *flag.FlagSet, name string) bool {
@@ -758,7 +680,7 @@ func applyFlagOverrides(cfg *Config, fs *flag.FlagSet, flags *configFlags) {
 }
 
 func loadConfig() (*Config, error) {
-	cfg, err := buildConfig(os.Args[1:], parseUCIConfig)
+	cfg, err := buildConfig(os.Args[1:], loadConfigFile)
 	if err != nil {
 		return nil, err
 	}
@@ -1239,6 +1161,12 @@ func startOps(cfg *Config, state *runtimeState, persister *traffic.Persister, ru
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Printf("tailscale-derp %s", version)
+	if schemaPath := schemaOutputPath(os.Args[1:]); schemaPath != "" {
+		if err := generateConfigSchema(schemaPath); err != nil {
+			log.Fatalf("Generate configuration schema: %v", err)
+		}
+		return
+	}
 
 	cfg, err := loadConfig()
 	if err != nil {

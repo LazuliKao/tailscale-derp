@@ -3,6 +3,53 @@
 Tailscale DERP and STUN server with optional client verification through the
 official Tailscale API.
 
+## Configuration formats
+
+Configuration-file support is selected at build time. A binary without a
+configuration build tag accepts command-line flags only. Enable one or more
+formats with Go build tags:
+
+```sh
+go build -tags uciconfig ./cmd/tailscale-derp
+go build -tags jsonconfig ./cmd/tailscale-derp
+go build -tags yamlconfig ./cmd/tailscale-derp
+go build -tags "uciconfig jsonconfig yamlconfig" ./cmd/tailscale-derp
+```
+
+The `--config` file name determines its format: `.json` selects JSON, `.yaml`
+or `.yml` selects YAML, and all other names select UCI. When `uciconfig` is
+enabled, `/etc/config/tailscale-derp` is the default configuration path.
+Selecting a format not included in the binary produces an error naming the
+required build tag. Command-line flags always override settings loaded from a
+file.
+
+JSON and YAML use the same nested configuration structure. For example:
+
+```yaml
+global:
+  enabled: true
+  listen: ":3478"
+  stun: true
+
+tls:
+  mode: self_signed
+
+verify_api:
+  - name: primary
+    tailnet: "-"
+    auth_type: api_key
+    api_key: tskey-api-...
+```
+
+Generate the committed JSON Schema with:
+
+```sh
+go generate ./...
+```
+
+The output is [`schema/tailscale-derp.schema.json`](schema/tailscale-derp.schema.json).
+It can also validate equivalent YAML in editors that support JSON Schema.
+
 ## Tailscale API configuration
 
 Define each tailnet in the main UCI configuration (normally
