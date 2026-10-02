@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/netip"
 
-	"github.com/LazuliKao/tailscale-derp/internal/tracker"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
@@ -22,8 +21,8 @@ type CertificateNameProvider interface {
 	CertName() string
 }
 
-func NewRuntime(ctx context.Context, cfg VerifyConfig, track *tracker.PeerTracker) *Runtime {
-	return &Runtime{verifier: newVerifierWithContext(ctx, cfg, track)}
+func NewRuntime(ctx context.Context, cfg VerifyConfig) *Runtime {
+	return &Runtime{verifier: newVerifierWithContext(ctx, cfg)}
 }
 
 func (r *Runtime) VerifyClientFunc() VerifyClientFunc {
@@ -31,7 +30,7 @@ func (r *Runtime) VerifyClientFunc() VerifyClientFunc {
 		if r != nil && r.verifier != nil && r.verifier.verify(ctx, tailcfg.DERPAdmitClientRequest{
 			NodePublic: nodeKey,
 			Source:     source,
-		}, source.String()) {
+		}) {
 			return nil
 		}
 		return fmt.Errorf("client %v not authorized by configured verifier", nodeKey)

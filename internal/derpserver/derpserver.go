@@ -41,6 +41,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/LazuliKao/tailscale-derp/internal/tracker"
 	"github.com/axiomhq/hyperloglog"
 	"github.com/go4org/hashtriemap"
 	"go4.org/mem"
@@ -191,9 +192,10 @@ type Server struct {
 	// running tailscaled's client's LocalAPI.
 	verifyClientsLocalTailscaled bool
 
-	verifyClientFunc       func(context.Context, key.NodePublic, netip.Addr) error
+	verifyClientFunc         func(context.Context, key.NodePublic, netip.Addr) error
 	verifyClientsURL         string
 	verifyClientsURLFailOpen bool
+	peerTracker              *tracker.PeerTracker
 
 	perClientSendQueueDepth int // Sets the client send queue depth for the server.
 	tcpWriteTimeout         time.Duration
@@ -518,6 +520,12 @@ func (s *Server) SetVerifyClientFunc(f func(context.Context, key.NodePublic, net
 	s.verifyClientFunc = f
 }
 
+// SetPeerTracker installs connection and packet-payload accounting.
+// It must be called before the server accepts clients.
+func (s *Server) SetPeerTracker(t *tracker.PeerTracker) {
+	s.peerTracker = t
+}
+
 // SetTailscaledSocketPath sets the unix socket path to use to talk to
 // tailscaled if client verification is enabled.
 //
@@ -831,6 +839,9 @@ func (s *Server) registerClient(c *sclient) {
 		s.curClientsNotIdeal.Add(1)
 	}
 	s.broadcastPeerStateChangeLocked(c.key, c.remoteIPPort, c.presentFlags(), true)
+	if s.peerTracker != nil && !c.canMesh {
+		s.peerTracker.Register(c.connNum, c.key.String(), c.remoteAddr, c.connectedAt)
+	}
 }
 
 // broadcastPeerStateChangeLocked enqueues a message to all watchers
@@ -854,6 +865,9 @@ func (s *Server) broadcastPeerStateChangeLocked(peer key.NodePublic, ipPort neti
 func (s *Server) unregisterClient(c *sclient) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.peerTracker != nil && !c.canMesh {
+		s.peerTracker.Unregister(c.connNum)
+	}
 
 	set, ok := s.clients.Load(c.key)
 	if !ok {
@@ -1062,6 +1076,7 @@ func (s *Server) accept(ctx context.Context, nc derp.Conn, brw *bufio.ReadWriter
 		logf:           logger.WithPrefix(s.logf, fmt.Sprintf("derp client %v%s: ", remoteAddr, clientKey.ShortString())),
 		ctx:            ctx,
 		remoteIPPort:   remoteIPPort,
+		remoteAddr:     remoteAddr,
 		connectedAt:    s.clock.Now(),
 		sendQueue:      make(chan pkt, s.perClientSendQueueDepth),
 		discoSendQueue: make(chan pkt, s.perClientSendQueueDepth),
@@ -1345,6 +1360,9 @@ func (c *sclient) handleFrameSendPacket(_ derp.FrameType, fl uint32) error {
 	dstKey, contents, err := s.recvPacket(c.br, fl)
 	if err != nil {
 		return fmt.Errorf("client %v: recvPacket: %v", c.key, err)
+	}
+	if s.peerTracker != nil {
+		s.peerTracker.Receive(c.connNum, len(contents))
 	}
 
 	dst, fwd, dstLen := c.lookupDest(dstKey)
@@ -1855,8 +1873,9 @@ type sclient struct {
 	key            key.NodePublic
 	info           derp.ClientInfo
 	logf           logger.Logf
-	ctx            context.Context  // closed when connection closes
-	remoteIPPort   netip.AddrPort   // zero if remoteAddr is not ip:port.
+	ctx            context.Context // closed when connection closes
+	remoteIPPort   netip.AddrPort  // zero if remoteAddr is not ip:port.
+	remoteAddr     string
 	sendQueue      chan pkt         // packets queued to this client; never closed
 	discoSendQueue chan pkt         // important packets queued to this client; never closed
 	sendPongCh     chan [8]byte     // pong replies to send to the client; never closed
@@ -2241,6 +2260,9 @@ func (c *sclient) sendPacket(srcKey key.NodePublic, contents []byte) (err error)
 		} else {
 			c.s.packetsSent.Add(1)
 			c.s.bytesSent.Add(int64(len(contents)))
+			if c.s.peerTracker != nil {
+				c.s.peerTracker.Send(c.connNum, len(contents))
+			}
 		}
 		c.debugLogf("sendPacket from %s: %v", srcKey.ShortString(), err)
 	}()

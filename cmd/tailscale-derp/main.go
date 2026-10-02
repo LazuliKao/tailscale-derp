@@ -803,6 +803,7 @@ func startDERP(ctx context.Context, cfg *Config, state *runtimeState, persister 
 	}
 
 	server := derpserver.New(privateKey, log.Printf)
+	server.SetPeerTracker(admissionTracker)
 	if cfg.Mesh {
 		if err := server.SetMeshKey(cfg.MeshKey); err != nil {
 			if state != nil {
@@ -815,7 +816,7 @@ func startDERP(ctx context.Context, cfg *Config, state *runtimeState, persister 
 		if runtime != nil {
 			server.SetVerifyClientFunc(runtime.VerifyClientFunc())
 		} else {
-			server.SetVerifyClientFunc(opsapi.NewVerifyClientFunc(cfg.Verify, admissionTracker))
+			server.SetVerifyClientFunc(opsapi.NewVerifyClientFunc(cfg.Verify))
 		}
 		log.Printf("Client verification enabled (urls: %v, tailscaled: %v, official API: %v)", cfg.Verify.URLsEnabled, cfg.Verify.TailscaledEnabled, cfg.Verify.APIEnabled)
 	} else {
@@ -1202,7 +1203,7 @@ func main() {
 			log.Fatalf("Invalid TLS certificate for external endpoint publishing: %v", err)
 		}
 	}
-	runtime := opsapi.NewRuntime(ctx, cfg.Verify, admissionTracker)
+	runtime := opsapi.NewRuntime(ctx, cfg.Verify)
 	if automaticTLS != nil {
 		runtime.SetCertificateNameProvider(automaticTLS)
 	}

@@ -91,13 +91,13 @@ type VerifyClientFunc func(context.Context, key.NodePublic, netip.Addr) error
 // retain their existing OR semantics: any enabled mechanism may allow a
 // client. The returned callback is intended to be passed directly to the
 // local derpserver package; it never uses the daemon's HTTP handlers.
-func NewVerifyClientFunc(cfg VerifyConfig, track *tracker.PeerTracker) VerifyClientFunc {
-	verifier := newVerifier(cfg, track)
+func NewVerifyClientFunc(cfg VerifyConfig) VerifyClientFunc {
+	verifier := newVerifier(cfg)
 	return func(ctx context.Context, nodeKey key.NodePublic, source netip.Addr) error {
 		if verifier.verify(ctx, tailcfg.DERPAdmitClientRequest{
 			NodePublic: nodeKey,
 			Source:     source,
-		}, source.String()) {
+		}) {
 			return nil
 		}
 		return fmt.Errorf("client %v not authorized by configured verifier", nodeKey)
@@ -290,19 +290,8 @@ func HandleClients(mf MetricsFunc) http.HandlerFunc {
 	}
 }
 
-// HandlePeers returns the list of tracked connected peers.
-func HandlePeers(t *tracker.PeerTracker) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			httpjson.Write(w, http.StatusMethodNotAllowed, map[string]string{"error": "GET required"})
-			return
-		}
-		httpjson.Write(w, http.StatusOK, t.GetAll())
-	}
-}
-
 func NewMux(cfg Config, snapshot Snapshot, executor Executor, mf MetricsFunc, t *tracker.PeerTracker, tf TrafficFunc) http.Handler {
-	runtime := NewRuntime(context.Background(), cfg.Verify, t)
+	runtime := NewRuntime(context.Background(), cfg.Verify)
 	return NewMuxWithRuntime(cfg, snapshot, executor, mf, t, tf, runtime, nil)
 }
 
@@ -324,7 +313,7 @@ func NewMuxWithRuntime(cfg Config, snapshot Snapshot, executor Executor, mf Metr
 	mux.HandleFunc("/ops", HandleOpsWithExecutor(executor))
 
 	if runtime == nil {
-		runtime = NewRuntime(context.Background(), cfg.Verify, t)
+		runtime = NewRuntime(context.Background(), cfg.Verify)
 	}
 	verifier := runtime.verifier
 	mux.HandleFunc("/devices", handleDevices(verifier))
@@ -355,7 +344,7 @@ func NewMuxWithRuntime(cfg Config, snapshot Snapshot, executor Executor, mf Metr
 	}
 
 	if t != nil {
-		mux.HandleFunc("/peers", HandlePeers(t))
+		mux.HandleFunc("/peers", handlePeerDetails(t, verifier))
 	}
 
 	mux.HandleFunc("/clients", HandleClients(mf))

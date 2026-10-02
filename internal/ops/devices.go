@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/LazuliKao/tailscale-derp/internal/httpjson"
-	"github.com/LazuliKao/tailscale-derp/internal/tracker"
 	"tailscale.com/client/local"
 	tailscaleapi "tailscale.com/client/tailscale/v2"
 	"tailscale.com/tailcfg"
@@ -453,14 +452,13 @@ type verifier struct {
 	cfg   VerifyConfig
 	local *local.Client
 	store *deviceStore
-	track *tracker.PeerTracker
 }
 
-func newVerifier(cfg VerifyConfig, track *tracker.PeerTracker) *verifier {
-	return newVerifierWithContext(context.Background(), cfg, track)
+func newVerifier(cfg VerifyConfig) *verifier {
+	return newVerifierWithContext(context.Background(), cfg)
 }
 
-func newVerifierWithContext(ctx context.Context, cfg VerifyConfig, track *tracker.PeerTracker) *verifier {
+func newVerifierWithContext(ctx context.Context, cfg VerifyConfig) *verifier {
 	cfg = normalizeVerifyConfig(cfg)
 	store := newDeviceStore(cfg)
 	store.start(ctx)
@@ -468,30 +466,23 @@ func newVerifierWithContext(ctx context.Context, cfg VerifyConfig, track *tracke
 	if cfg.TailscaledSocketEnabled {
 		localClient.Socket = cfg.TailscaledSocket
 	}
-	return &verifier{cfg: cfg, local: localClient, store: store, track: track}
+	return &verifier{cfg: cfg, local: localClient, store: store}
 }
 
-func (v *verifier) verify(ctx context.Context, request tailcfg.DERPAdmitClientRequest, remoteAddr string) bool {
+func (v *verifier) verify(ctx context.Context, request tailcfg.DERPAdmitClientRequest) bool {
 	if !v.cfg.Enabled {
 		return true
 	}
 	if v.cfg.URLsEnabled && v.verifyURLs(request.NodePublic) {
-		return v.accept(request.NodePublic, remoteAddr)
+		return true
 	}
 	if v.cfg.TailscaledEnabled && v.verifyTailscaled(ctx, request.NodePublic) {
-		return v.accept(request.NodePublic, remoteAddr)
+		return true
 	}
 	if v.cfg.APIEnabled && v.store.allowed(request.NodePublic, time.Now()) {
-		return v.accept(request.NodePublic, remoteAddr)
+		return true
 	}
 	return false
-}
-
-func (v *verifier) accept(nodeKey key.NodePublic, remoteAddr string) bool {
-	if v.track != nil {
-		v.track.Add(nodeKey.String(), remoteAddr)
-	}
-	return true
 }
 
 func (v *verifier) verifyTailscaled(ctx context.Context, nodeKey key.NodePublic) bool {

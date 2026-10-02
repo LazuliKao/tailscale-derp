@@ -27,7 +27,7 @@ func TestVerifierCombinesMechanismsWithOR(t *testing.T) {
 			ttl: time.Minute,
 		},
 	}
-	if !verifier.verify(context.Background(), tailcfg.DERPAdmitClientRequest{NodePublic: nodeKey}, "") {
+	if !verifier.verify(context.Background(), tailcfg.DERPAdmitClientRequest{NodePublic: nodeKey}) {
 		t.Fatal("expected Official API mechanism to allow the client")
 	}
 }
@@ -35,7 +35,7 @@ func TestVerifierCombinesMechanismsWithOR(t *testing.T) {
 func TestNewVerifierUsesConfiguredTailscaledSocketOnlyWhenEnabled(t *testing.T) {
 	const socket = "/tmp/custom-tailscaled.sock"
 
-	defaultVerifier := newVerifier(VerifyConfig{TailscaledSocket: socket}, nil)
+	defaultVerifier := newVerifier(VerifyConfig{TailscaledSocket: socket})
 	if defaultVerifier.local.Socket != "" {
 		t.Fatalf("expected default socket when custom socket is disabled, got %q", defaultVerifier.local.Socket)
 	}
@@ -43,7 +43,7 @@ func TestNewVerifierUsesConfiguredTailscaledSocketOnlyWhenEnabled(t *testing.T) 
 	customVerifier := newVerifier(VerifyConfig{
 		TailscaledSocketEnabled: true,
 		TailscaledSocket:        socket,
-	}, nil)
+	})
 	if customVerifier.local.Socket != socket {
 		t.Fatalf("expected custom socket %q, got %q", socket, customVerifier.local.Socket)
 	}
